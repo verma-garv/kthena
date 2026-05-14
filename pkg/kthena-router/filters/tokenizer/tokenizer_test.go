@@ -24,8 +24,8 @@ import (
 )
 
 // TestSimpleEstimateTokenizer will verify SimpleEstimateTokenizer correctly
-// will also estimake token count using the 4 characters per token heuristic
-// including the cieling divison for non-multiples of 4
+// will also estimate token count using the 4 characters per token heuristic
+// including the ceiling division for non-multiples of 4
 func TestSimpleEstimateTokenizer(t *testing.T) {
 	tokenizer := NewSimpleEstimateTokenizer()
 
@@ -85,7 +85,7 @@ func TestSimpleEstimateTokenizer(t *testing.T) {
 	}
 }
 
-// TestTickToken verifies that TickToken produces resonable token counts
+// TestTickToken verifies that TickToken produces reasonable token counts
 // using the cl100k_ base encoding via the offline BPE loader
 // will not require network access
 func TestTickToken(t *testing.T) {
