@@ -63,7 +63,8 @@ func waitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kth
 		_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
 		if err != nil {
 			errStr := err.Error()
-			if strings.Contains(errStr, "connect: connection refused") ||
+			if strings.Contains(errStr, "failed calling webhook") ||
+				strings.Contains(errStr, "connect: connection refused") ||
 				strings.Contains(errStr, "i/o timeout") ||
 				strings.Contains(errStr, "context deadline exceeded") {
 				t.Logf("Router validating webhook not ready yet, retrying: %v", err)
