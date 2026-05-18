@@ -1,7 +1,7 @@
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata:
-  name: qwen3-8b-sglang-pd
+  name: deepseek-r1-1-5b-sglang-pd
   namespace: default
 spec:
   schedulerName: volcano
@@ -11,11 +11,6 @@ spec:
       - name: prefill
         replicas: 1
         entryTemplate:
-          metadata:
-            labels:
-              app: qwen3-8b-sglang-pd
-              modelserving.volcano.sh/group-name: "group-0"
-              modelserving.volcano.sh/rolename: "P-instance"
           spec:
             containers:
               - name: leader
@@ -30,11 +25,6 @@ spec:
       - name: decode
         replicas: 1
         entryTemplate:
-          metadata:
-            labels:
-              app: qwen3-8b-sglang-pd
-              modelserving.volcano.sh/group-name: "group-0"
-              modelserving.volcano.sh/rolename: "D-instance"
           spec:
             containers:
               - name: leader

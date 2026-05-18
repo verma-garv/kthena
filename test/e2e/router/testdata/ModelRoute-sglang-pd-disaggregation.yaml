@@ -1,11 +1,11 @@
 apiVersion: networking.serving.volcano.sh/v1alpha1
 kind: ModelRoute
 metadata:
-  name: qwen3-8b-sglang-pd-disaggregation
+  name: deepseek-r1-1-5b-sglang-pd-disaggregation
   namespace: default
 spec:
-  modelName: "qwen3-8b-sglang-pd-disaggregation"
+  modelName: "deepseek-r1-1-5b-sglang-pd-disaggregation"
   rules:
     - name: "default"
       targetModels:
-        - modelServerName: "qwen3-8b-sglang-pd-disaggregation"
+        - modelServerName: "deepseek-r1-1-5b-sglang-pd-disaggregation"
