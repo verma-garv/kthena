@@ -585,7 +585,7 @@ func podGroupCRDHasSubGroup(crd *apiextv1.CustomResourceDefinition) bool {
 
 // syncPodGroupGroupNetworkTopology sets or clears PodGroup group-level NetworkTopology
 // from ModelServing spec.template.networkTopology.groupPolicy.
-func syncPodGroupGroupNetworkTopology(ms *workloadv1alpha1.ModelServing, spec *schedulingv1beta1.PodGroupSpec) {
+func syncPodGroupNetworkTopology(ms *workloadv1alpha1.ModelServing, spec *schedulingv1beta1.PodGroupSpec) {
 	if ms.Spec.Template.NetworkTopology != nil && ms.Spec.Template.NetworkTopology.GroupPolicy != nil {
 		spec.NetworkTopology = ms.Spec.Template.NetworkTopology.GroupPolicy
 		return
