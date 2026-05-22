@@ -89,7 +89,9 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify the image was updated on all non-terminating pods
 	require.Eventually(t, func() bool {
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
 		if err != nil || len(pods.Items) == 0 {
@@ -124,7 +126,9 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify the ModelServing is deleted
 	require.Eventually(t, func() bool {
-		_, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, modelServing.Name, metav1.GetOptions{})
 		if err == nil {
 			return false
 		}
