@@ -64,9 +64,9 @@ var (
 const (
 	defaultQueueQPS = 100 //nolint:unused // pre-existing constant kept for future use
 
-	// defaultMetricsUpdateInterval is the default polling interval for pod metrics.
-	defaultMetricsUpdateInterval = 1 * time.Second
-	metricsUpdateIntervalEnv     = "METRICS_UPDATE_INTERVAL"
+	// defaultMetricsScrapeInterval is the default polling interval for pod metrics.
+	defaultMetricsScrapeInterval = 1 * time.Second
+	metricsScrapeIntervalEnv     = "METRICS_SCRAPE_INTERVAL"
 
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
 	// At most one HMGET is issued per interval regardless of request rate;
@@ -362,7 +362,7 @@ type store struct {
 	podRuntimeInspector   PodRuntimeInspector
 	rootCtx               context.Context // Lifecycle context for queue goroutines, set by Run()
 	fairnessQueueConfig   FairnessQueueConfig
-	metricsUpdateInterval time.Duration
+	metricsScrapeInterval time.Duration
 }
 
 func New(opts ...Option) Store {
@@ -384,7 +384,7 @@ func New(opts ...Option) Store {
 		tokenTracker:          createTokenTracker(),
 		podRuntimeInspector:   realPodRuntimeInspector{},
 		fairnessQueueConfig:   createFairnessQueueConfig(),
-		metricsUpdateInterval: parseMetricsUpdateInterval(),
+		metricsScrapeInterval: parseMetricsScrapeInterval(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -460,34 +460,35 @@ func isValidFairnessWeight(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
-func parseMetricsUpdateInterval() time.Duration {
-	if v := os.Getenv(metricsUpdateIntervalEnv); v != "" {
+func parseMetricsScrapeInterval() time.Duration {
+	if v := os.Getenv(metricsScrapeIntervalEnv); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		} else {
-			klog.Warningf("Invalid %s: %q, using default %v", metricsUpdateIntervalEnv, v, defaultMetricsUpdateInterval)
+			klog.Warningf("Invalid %s: %q, using default %v", metricsScrapeIntervalEnv, v, defaultMetricsScrapeInterval)
 		}
 	}
-	return defaultMetricsUpdateInterval
+	return defaultMetricsScrapeInterval
 }
 
 func (s *store) Run(ctx context.Context) {
 	s.rootCtx = ctx
 	go func() {
 		for {
+			s.pods.Range(func(key, value any) bool {
+				if p, ok := value.(*PodInfo); ok {
+					s.updatePodMetrics(p)
+					s.updatePodModels(p)
+				}
+				return true
+			})
+			s.initialSynced.Store(true)
+			t := time.NewTimer(s.metricsScrapeInterval)
 			select {
 			case <-ctx.Done():
+				t.Stop()
 				return
-			default:
-				s.pods.Range(func(key, value any) bool {
-					if p, ok := value.(*PodInfo); ok {
-						s.updatePodMetrics(p)
-						s.updatePodModels(p)
-					}
-					return true
-				})
-				s.initialSynced.Store(true)
-				time.Sleep(s.metricsUpdateInterval)
+			case <-t.C:
 			}
 		}
 	}()

@@ -43,7 +43,7 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
-func TestParseMetricsUpdateInterval(t *testing.T) {
+func TestParseMetricsScrapeInterval(t *testing.T) {
 	tests := []struct {
 		name     string
 		envValue string
@@ -52,7 +52,7 @@ func TestParseMetricsUpdateInterval(t *testing.T) {
 		{
 			name:     "default when env empty",
 			envValue: "",
-			expected: defaultMetricsUpdateInterval,
+			expected: defaultMetricsScrapeInterval,
 		},
 		{
 			name:     "valid duration 200ms",
@@ -72,39 +72,39 @@ func TestParseMetricsUpdateInterval(t *testing.T) {
 		{
 			name:     "invalid duration falls back to default",
 			envValue: "notaduration",
-			expected: defaultMetricsUpdateInterval,
+			expected: defaultMetricsScrapeInterval,
 		},
 		{
 			name:     "zero duration falls back to default",
 			envValue: "0s",
-			expected: defaultMetricsUpdateInterval,
+			expected: defaultMetricsScrapeInterval,
 		},
 		{
 			name:     "negative duration falls back to default",
 			envValue: "-1s",
-			expected: defaultMetricsUpdateInterval,
+			expected: defaultMetricsScrapeInterval,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("METRICS_UPDATE_INTERVAL", tc.envValue)
-			got := parseMetricsUpdateInterval()
+			t.Setenv("METRICS_SCRAPE_INTERVAL", tc.envValue)
+			got := parseMetricsScrapeInterval()
 			assert.Equal(t, tc.expected, got)
 		})
 	}
 }
 
-func TestNewStoreUsesMetricsUpdateInterval(t *testing.T) {
-	t.Setenv("METRICS_UPDATE_INTERVAL", "2s")
+func TestNewStoreUsesMetricsScrapeInterval(t *testing.T) {
+	t.Setenv("METRICS_SCRAPE_INTERVAL", "2s")
 	s := New().(*store)
-	assert.Equal(t, 2*time.Second, s.metricsUpdateInterval)
+	assert.Equal(t, 2*time.Second, s.metricsScrapeInterval)
 }
 
-func TestNewStoreUsesDefaultMetricsUpdateInterval(t *testing.T) {
-	t.Setenv("METRICS_UPDATE_INTERVAL", "")
+func TestNewStoreUsesDefaultMetricsScrapeInterval(t *testing.T) {
+	t.Setenv("METRICS_SCRAPE_INTERVAL", "")
 	s := New().(*store)
-	assert.Equal(t, defaultMetricsUpdateInterval, s.metricsUpdateInterval)
+	assert.Equal(t, defaultMetricsScrapeInterval, s.metricsScrapeInterval)
 }
 
 func TestCreateFairnessQueueConfig_RejectsInvalidWeights(t *testing.T) {
