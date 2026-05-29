@@ -62,9 +62,9 @@ var (
 )
 
 const (
-	// Configuration constants for fairness scheduling
-	defaultQueueQPS = 100
-	uppdateInterval = 1 * time.Second
+	// defaultMetricsScrapeInterval is the default polling interval for pod metrics.
+	defaultMetricsScrapeInterval = 1 * time.Second
+	metricsScrapeIntervalEnv     = "METRICS_SCRAPE_INTERVAL"
 
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
 	// At most one HMGET is issued per interval regardless of request rate;
@@ -363,11 +363,12 @@ type store struct {
 	// initialSynced is used to indicate whether all the resources has been processed and storred into this store.
 	initialSynced *atomic.Bool
 	// model -> RequestPriorityQueue
-	requestWaitingQueue sync.Map
-	tokenTracker        TokenTracker
-	podRuntimeInspector PodRuntimeInspector
-	rootCtx             context.Context // Lifecycle context for queue goroutines, set by Run()
-	fairnessQueueConfig FairnessQueueConfig
+	requestWaitingQueue   sync.Map
+	tokenTracker          TokenTracker
+	podRuntimeInspector   PodRuntimeInspector
+	rootCtx               context.Context // Lifecycle context for queue goroutines, set by Run()
+	fairnessQueueConfig   FairnessQueueConfig
+	metricsScrapeInterval time.Duration
 }
 
 func New(opts ...Option) Store {
@@ -386,9 +387,10 @@ func New(opts ...Option) Store {
 		initialSynced:       &atomic.Bool{},
 		requestWaitingQueue: sync.Map{},
 		// Create token tracker with environment-based configuration
-		tokenTracker:        createTokenTracker(),
-		podRuntimeInspector: realPodRuntimeInspector{},
-		fairnessQueueConfig: createFairnessQueueConfig(),
+		tokenTracker:          createTokenTracker(),
+		podRuntimeInspector:   realPodRuntimeInspector{},
+		fairnessQueueConfig:   createFairnessQueueConfig(),
+		metricsScrapeInterval: parseMetricsScrapeInterval(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -464,23 +466,35 @@ func isValidFairnessWeight(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
+func parseMetricsScrapeInterval() time.Duration {
+	if v := os.Getenv(metricsScrapeIntervalEnv); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		} else {
+			klog.Warningf("Invalid %s: %q, using default %v", metricsScrapeIntervalEnv, v, defaultMetricsScrapeInterval)
+		}
+	}
+	return defaultMetricsScrapeInterval
+}
+
 func (s *store) Run(ctx context.Context) {
 	s.rootCtx = ctx
 	go func() {
+		ticker := time.NewTicker(s.metricsScrapeInterval)
+		defer ticker.Stop()
 		for {
+			s.pods.Range(func(key, value any) bool {
+				if p, ok := value.(*PodInfo); ok {
+					s.updatePodMetrics(p)
+					s.updatePodModels(p)
+				}
+				return true
+			})
+			s.initialSynced.Store(true)
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				s.pods.Range(func(key, value any) bool {
-					if p, ok := value.(*PodInfo); ok {
-						s.updatePodMetrics(p)
-						s.updatePodModels(p)
-					}
-					return true
-				})
-				s.initialSynced.Store(true)
-				time.Sleep(uppdateInterval)
+			case <-ticker.C:
 			}
 		}
 	}()
