@@ -22,7 +22,8 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - --model=Qwen/Qwen3-8B
+                  - --model=kthena-mock-sglang
+                  - --served-model-name=Qwen/Qwen3-8B
                   - --port=30000
                   - --mode=echo
                   - --time-to-first-token=0ms

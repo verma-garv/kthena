@@ -17,8 +17,12 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - --model=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+                  - --model=kthena-mock-1.5b-prefill
+                  - --served-model-name=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
                   - --port=30000
+                  - --mode=echo
+                  - --time-to-first-token=0ms
+                  - --inter-token-latency=0ms
                   - --disaggregation-mode=prefill
                 ports:
                   - containerPort: 30000
@@ -38,8 +42,13 @@ spec:
                 image: ghcr.io/faust-benchou/sglang-inference-sim:0.1.1
                 imagePullPolicy: IfNotPresent
                 args:
-                  - --model=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+                  - --model=kthena-mock-1.5b-decode
+                  - --served-model-name=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
                   - --port=30000
+                  - --mode=echo
+                  - --time-to-first-token=0ms
+                  - --inter-token-latency=0ms
+                  - --kv-cache-transfer-latency=1ms
                   - --disaggregation-mode=decode
                 ports:
                   - containerPort: 30000
