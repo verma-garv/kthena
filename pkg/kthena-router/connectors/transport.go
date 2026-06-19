@@ -73,7 +73,7 @@ func decoderProxy(c *gin.Context, req *http.Request) (int, error) {
 		// Handle streaming response
 		outputTokens, err := handleStreamingResponse(c, resp)
 		if err != nil {
-			return 0, fmt.Errorf("streaming decode interrupted: %w", err)
+			return outputTokens, fmt.Errorf("streaming decode interrupted: %w", err)
 		}
 		return outputTokens, nil
 	} else {
