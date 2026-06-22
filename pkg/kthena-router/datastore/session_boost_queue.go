@@ -17,17 +17,18 @@ limitations under the License.
 package datastore
 
 import (
-	"container/heap"
 	"context"
-	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"k8s.io/klog/v2"
-
-	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 )
+
+// This file extends RequestPriorityQueue with session-boost behavior. When a
+// queue is constructed with FairnessQueueConfig.SessionBoostEnabled, the shared
+// priority-queue framework in fairness_queue.go reuses the same heap, push/pop,
+// cancellation and shutdown logic, while the ordering and dequeue strategy below
+// replace per-user fairness with session-aware boosting for prefix-cache reuse.
 
 // BackendWaitingChecker is a function that checks whether the backend pods
 // have capacity to accept new requests. It returns true when at least one pod
@@ -100,218 +101,63 @@ func (st *SessionTracker) ActiveSessions() int {
 	return len(st.sessions)
 }
 
-// SessionBoostQueueConfig holds configurable parameters for the standalone session boost queue.
-type SessionBoostQueueConfig struct {
-	// SessionIDHeader is the HTTP header name used to identify conversation sessions.
-	// Configured via the SESSION_BOOST_HEADER environment variable. If not set,
-	// session identification is disabled.
-	SessionIDHeader string
-
-	// SessionBoostTTL is the duration after which a session boost expires.
-	// Requests from the same session that arrive within this window after the
-	// previous request completed will be boosted.
-	SessionBoostTTL time.Duration
-
-	// SessionBoostGracePeriod is the duration to wait after a release before dequeuing
-	// the next request in backpressure mode.
-	// This gives the same session time to submit a follow-up request that benefits
-	// from prefix cache, rather than immediately dispatching an unrelated request.
-	// If a session-boosted request arrives during this window, it is dequeued immediately.
-	// Defaults to 50ms. Set to 0 to disable the grace period.
-	SessionBoostGracePeriod time.Duration
-
-	// BackpressurePollInterval controls how often the backpressure checker polls
-	// backend pod waiting queue status. Defaults to 100ms.
-	BackpressurePollInterval time.Duration
-
-	// InflightPerPod is the maximum number of inflight requests allowed per backend pod.
-	// The total inflight limit is InflightPerPod * podCount.
-	// Defaults to 1.
-	InflightPerPod int
-}
-
-// DefaultSessionBoostQueueConfig returns default configuration for the session boost queue.
-func DefaultSessionBoostQueueConfig() SessionBoostQueueConfig {
-	return SessionBoostQueueConfig{
-		SessionIDHeader:          "", // Must be set via SESSION_BOOST_HEADER env var
-		SessionBoostTTL:          60 * time.Second,
-		SessionBoostGracePeriod:  0,
-		BackpressurePollInterval: 100 * time.Millisecond,
-		InflightPerPod:           16,
+// MarkSessionCompleted records that a request from the given session has completed,
+// enabling priority boosting for follow-up requests in the same session. No-op when
+// the queue is not in session-boost mode.
+func (pq *RequestPriorityQueue) MarkSessionCompleted(sessionID string) {
+	if pq.sessionTracker != nil {
+		pq.sessionTracker.MarkCompleted(sessionID)
 	}
 }
 
-// sessionBoostHeap implements heap.Interface for session boost priority ordering.
-// Boosted requests always take priority over non-boosted ones.
-// Within the same boost status, FIFO ordering is used.
-type sessionBoostHeap struct {
-	items []*Request
+// GetSessionTracker returns the session tracker, or nil if session boost is disabled.
+func (pq *RequestPriorityQueue) GetSessionTracker() *SessionTracker {
+	return pq.sessionTracker
 }
 
-func (h *sessionBoostHeap) Len() int { return len(h.items) }
-
-func (h *sessionBoostHeap) Less(i, j int) bool {
-	// Session-boosted requests always take priority over non-boosted ones.
-	if h.items[i].SessionBoost != h.items[j].SessionBoost {
-		return h.items[i].SessionBoost
-	}
-	// Within same boost status, use FIFO ordering.
-	return h.items[i].RequestTime.Before(h.items[j].RequestTime)
+// GetInflightCount returns the current number of inflight requests in session-boost mode.
+func (pq *RequestPriorityQueue) GetInflightCount() int64 {
+	return pq.inflightCount.Load()
 }
 
-func (h *sessionBoostHeap) Swap(i, j int) {
-	h.items[i], h.items[j] = h.items[j], h.items[i]
-}
-
-func (h *sessionBoostHeap) Push(x interface{}) {
-	h.items = append(h.items, x.(*Request))
-}
-
-func (h *sessionBoostHeap) Pop() interface{} {
-	n := len(h.items)
-	if n == 0 {
-		return nil
-	}
-	item := h.items[n-1]
-	h.items[n-1] = nil
-	h.items = h.items[0 : n-1]
-	return item
-}
-
-// SessionBoostQueue implements session-aware priority boosting for multi-turn
-// conversations to maximize prefix cache hit rate on LLM inference backends.
-type SessionBoostQueue struct {
-	stopCh   chan struct{}
-	notifyCh chan struct{}
-	mu       sync.RWMutex
-	heap     sessionBoostHeap
-	metrics  *metrics.Metrics
-	config   SessionBoostQueueConfig
-
-	// Session tracking for priority boosting
-	sessionTracker *SessionTracker
-
-	// Backend capacity checking
-	backendChecker BackendWaitingChecker
-
-	// Inflight tracking for backpressure mode
-	inflightCount atomic.Int64
-	releaseCh     chan struct{}
-	podCounter    func() int
-}
-
-// NewSessionBoostQueue creates a new standalone session boost queue.
-func NewSessionBoostQueue(metricsInstance *metrics.Metrics, cfg SessionBoostQueueConfig, checker ...BackendWaitingChecker) *SessionBoostQueue {
-	if metricsInstance == nil {
-		metricsInstance = metrics.DefaultMetrics
-	}
-	q := &SessionBoostQueue{
-		stopCh:         make(chan struct{}),
-		notifyCh:       make(chan struct{}, 1),
-		releaseCh:      make(chan struct{}, 1),
-		heap:           sessionBoostHeap{items: make([]*Request, 0)},
-		metrics:        metricsInstance,
-		config:         cfg,
-		sessionTracker: NewSessionTracker(cfg.SessionBoostTTL),
-	}
-	if len(checker) > 0 && checker[0] != nil {
-		q.backendChecker = checker[0]
-	}
-	return q
-}
-
-// PushRequest adds a request to the session boost queue.
-// If the request's session ID matches a recently completed session, it is boosted.
-func (q *SessionBoostQueue) PushRequest(r *Request) error {
-	q.mu.Lock()
-
-	// Check session boost: if this request's session ID has a recent completion,
-	// mark it as boosted so it gets priority in the queue.
-	if r.SessionID != "" && q.sessionTracker.HasRecentCompletion(r.SessionID) {
-		r.SessionBoost = true
-	}
-
-	heap.Push(&q.heap, r)
-	queueLen := q.heap.Len()
-	q.mu.Unlock()
-
-	// Update metrics
-	if q.metrics != nil {
-		q.metrics.IncSessionBoostQueueSize(r.ModelName)
-	}
-
-	if r.SessionBoost {
-		klog.V(4).Infof("[SessionBoostQueue] session boost: reqID=%s sessionID=%s promoted, queueLen=%d",
-			r.ReqID, r.SessionID, queueLen)
-	}
-
-	// Signal that a new item is available
-	select {
-	case q.notifyCh <- struct{}{}:
-	default:
-	}
-	return nil
-}
-
-// popWhenAvailable blocks until an item is available or the context is done.
-func (q *SessionBoostQueue) popWhenAvailable(ctx context.Context) (*Request, error) {
-	for {
-		q.mu.Lock()
-		if q.heap.Len() > 0 {
-			req := heap.Pop(&q.heap).(*Request)
-
-			// Skip cancelled requests
-			if req.isCancelled() {
-				if q.metrics != nil {
-					q.metrics.DecSessionBoostQueueSize(req.ModelName)
-					queueDuration := time.Since(req.RequestTime)
-					q.metrics.RecordSessionBoostQueueDuration(req.ModelName, queueDuration)
-					q.metrics.IncSessionBoostQueueCancelled(req.ModelName)
-				}
-				q.mu.Unlock()
-				continue
-			}
-
-			queueDuration := time.Since(req.RequestTime)
-			if q.metrics != nil {
-				q.metrics.DecSessionBoostQueueSize(req.ModelName)
-				q.metrics.RecordSessionBoostQueueDuration(req.ModelName, queueDuration)
-				q.metrics.IncSessionBoostQueueDequeue(req.ModelName)
-			}
-			q.mu.Unlock()
-			return req, nil
-		}
-		q.mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-q.stopCh:
-			return nil, errors.New("queue stopped")
-		case <-q.notifyCh:
-			continue
-		}
-	}
-}
-
-// Run starts the dequeue loop. Uses backpressure mode when a backend checker is provided,
-// otherwise falls through immediately (no rate limiting — suitable for direct dispatch).
-func (q *SessionBoostQueue) Run(ctx context.Context) {
+// runSessionBoostMode is the session-boost dequeue loop. It uses backend backpressure
+// when a checker is configured, otherwise dequeues directly (no rate limiting).
+func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
 	// Start session tracker cleanup goroutine
-	go q.runSessionCleanup(ctx)
+	go pq.runSessionCleanup(ctx)
 
-	if q.backendChecker != nil {
-		q.runBackpressureMode(ctx)
+	if pq.backendChecker != nil {
+		pq.runBackpressureMode(ctx)
 		return
 	}
-	// Without backpressure checker, dequeue immediately (no rate limiting).
-	q.runDirectMode(ctx)
+	pq.runDirectMode(ctx)
+}
+
+// admitSessionBoost marks a request as inflight, installs its release callback and
+// unblocks the waiting caller by closing its NotifyChan.
+func (pq *RequestPriorityQueue) admitSessionBoost(req *Request) {
+	pq.inflightCount.Add(1)
+	releaseOnce := sync.Once{}
+	req.Release = func() {
+		releaseOnce.Do(func() {
+			pq.inflightCount.Add(-1)
+			select {
+			case pq.releaseCh <- struct{}{}:
+			default:
+			}
+			pq.metricDecInflight(req.ModelName)
+		})
+	}
+	pq.metricIncInflight(req.ModelName)
+	if req.NotifyChan != nil {
+		close(req.NotifyChan)
+	}
 }
 
 // runDirectMode dequeues requests as fast as they arrive with no rate limiting.
-func (q *SessionBoostQueue) runDirectMode(ctx context.Context) {
+func (pq *RequestPriorityQueue) runDirectMode(ctx context.Context) {
 	for {
-		req, err := q.popWhenAvailable(ctx)
+		req, err := pq.popWhenAvailable(ctx)
 		if err != nil {
 			return
 		}
@@ -321,32 +167,13 @@ func (q *SessionBoostQueue) runDirectMode(ctx context.Context) {
 		if req.isCancelled() {
 			continue
 		}
-
-		// Track inflight
-		q.inflightCount.Add(1)
-		releaseOnce := sync.Once{}
-		req.Release = func() {
-			releaseOnce.Do(func() {
-				q.inflightCount.Add(-1)
-				select {
-				case q.releaseCh <- struct{}{}:
-				default:
-				}
-				if q.metrics != nil {
-					q.metrics.DecSessionBoostQueueInflight(req.ModelName)
-				}
-			})
-		}
-		if q.metrics != nil {
-			q.metrics.IncSessionBoostQueueInflight(req.ModelName)
-		}
-		close(req.NotifyChan)
+		pq.admitSessionBoost(req)
 	}
 }
 
 // runSessionCleanup periodically cleans up expired sessions from the session tracker.
-func (q *SessionBoostQueue) runSessionCleanup(ctx context.Context) {
-	cleanupInterval := q.config.SessionBoostTTL
+func (pq *RequestPriorityQueue) runSessionCleanup(ctx context.Context) {
+	cleanupInterval := pq.config.SessionBoostTTL
 	if cleanupInterval < 10*time.Second {
 		cleanupInterval = 10 * time.Second
 	}
@@ -356,54 +183,56 @@ func (q *SessionBoostQueue) runSessionCleanup(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-q.stopCh:
+		case <-pq.stopCh:
 			return
 		case <-ticker.C:
-			q.sessionTracker.Cleanup()
+			if pq.sessionTracker != nil {
+				pq.sessionTracker.Cleanup()
+			}
 		}
 	}
 }
 
 // runBackpressureMode dequeues requests only when backend pods have capacity.
 // Uses two-level admission control:
-//  1. Inflight limit: at most InflightPerPod requests per backend pod.
+//  1. Inflight limit: at most MaxConcurrent requests in flight across all backends.
 //  2. Backend metrics check: at least one pod reports capacity available.
 //
 // Session Grace Period: When SessionBoostGracePeriod > 0, a release event triggers
 // a short wait before dequeuing to give the same session time to submit a follow-up
 // request that can leverage prefix cache.
-func (q *SessionBoostQueue) runBackpressureMode(ctx context.Context) {
-	pollInterval := q.config.BackpressurePollInterval
+func (pq *RequestPriorityQueue) runBackpressureMode(ctx context.Context) {
+	pollInterval := pq.config.BackpressurePollInterval
 	if pollInterval <= 0 {
 		pollInterval = 100 * time.Millisecond
 	}
-	klog.V(4).Infof("[SessionBoostQueue] starting backpressure dequeue loop, poll_interval=%v, gracePeriod=%v",
-		pollInterval, q.config.SessionBoostGracePeriod)
+	klog.V(4).Infof("[SessionBoost] starting backpressure dequeue loop, poll_interval=%v, gracePeriod=%v",
+		pollInterval, pq.config.SessionBoostGracePeriod)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	if q.config.SessionBoostGracePeriod > 0 {
-		q.runBackpressureWithGrace(ctx, ticker)
+	if pq.config.SessionBoostGracePeriod > 0 {
+		pq.runBackpressureWithGrace(ctx, ticker)
 	} else {
-		q.runBackpressureNoGrace(ctx, ticker)
+		pq.runBackpressureNoGrace(ctx, ticker)
 	}
 }
 
 // runBackpressureNoGrace is the fast path when grace period is disabled (default).
 // Listens on notifyCh for immediate dequeue of freshly enqueued requests.
-func (q *SessionBoostQueue) runBackpressureNoGrace(ctx context.Context, ticker *time.Ticker) {
+func (pq *RequestPriorityQueue) runBackpressureNoGrace(ctx context.Context, ticker *time.Ticker) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-q.stopCh:
+		case <-pq.stopCh:
 			return
-		case <-q.releaseCh:
-			q.tryBackpressureDequeue(ctx)
-		case <-q.notifyCh:
-			q.tryBackpressureDequeue(ctx)
+		case <-pq.releaseCh:
+			pq.tryBackpressureDequeue(ctx)
+		case <-pq.notifyCh:
+			pq.tryBackpressureDequeue(ctx)
 		case <-ticker.C:
-			q.tryBackpressureDequeue(ctx)
+			pq.tryBackpressureDequeue(ctx)
 		}
 	}
 }
@@ -411,59 +240,59 @@ func (q *SessionBoostQueue) runBackpressureNoGrace(ctx context.Context, ticker *
 // runBackpressureWithGrace handles the case where grace period is configured.
 // Does NOT listen on notifyCh in the main select to avoid racing with the grace
 // period logic on releaseCh. The ticker serves as the backstop for new arrivals.
-func (q *SessionBoostQueue) runBackpressureWithGrace(ctx context.Context, ticker *time.Ticker) {
+func (pq *RequestPriorityQueue) runBackpressureWithGrace(ctx context.Context, ticker *time.Ticker) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-q.stopCh:
+		case <-pq.stopCh:
 			return
-		case <-q.releaseCh:
-			q.waitGraceAndDequeue(ctx)
+		case <-pq.releaseCh:
+			pq.waitGraceAndDequeue(ctx)
 		case <-ticker.C:
-			q.tryBackpressureDequeue(ctx)
+			pq.tryBackpressureDequeue(ctx)
 		}
 	}
 }
 
 // isHeadSessionBoosted checks if the highest-priority request in the queue has a session boost.
-func (q *SessionBoostQueue) isHeadSessionBoosted() bool {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	if q.heap.Len() == 0 {
+func (pq *RequestPriorityQueue) isHeadSessionBoosted() bool {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	if len(pq.heap) == 0 {
 		return false
 	}
-	return q.heap.items[0].SessionBoost
+	return pq.heap[0].SessionBoost
 }
 
 // waitGraceAndDequeue waits up to SessionBoostGracePeriod for a session-boosted
 // request to arrive at the head of the queue.
-func (q *SessionBoostQueue) waitGraceAndDequeue(ctx context.Context) {
+func (pq *RequestPriorityQueue) waitGraceAndDequeue(ctx context.Context) {
 	// Fast path: head is already session-boosted.
-	if q.isHeadSessionBoosted() {
-		klog.V(4).Info("[SessionBoostQueue] grace: head already boosted, skipping wait")
-		q.tryBackpressureDequeue(ctx)
+	if pq.isHeadSessionBoosted() {
+		klog.V(4).Info("[SessionBoost] grace: head already boosted, skipping wait")
+		pq.tryBackpressureDequeue(ctx)
 		return
 	}
 
-	klog.V(4).Infof("[SessionBoostQueue] grace: starting grace period %v", q.config.SessionBoostGracePeriod)
-	timer := time.NewTimer(q.config.SessionBoostGracePeriod)
+	klog.V(4).Infof("[SessionBoost] grace: starting grace period %v", pq.config.SessionBoostGracePeriod)
+	timer := time.NewTimer(pq.config.SessionBoostGracePeriod)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-q.stopCh:
+		case <-pq.stopCh:
 			return
-		case <-q.notifyCh:
-			if q.isHeadSessionBoosted() {
-				klog.V(4).Info("[SessionBoostQueue] grace period: session-boosted request arrived, dequeuing immediately")
-				q.tryBackpressureDequeue(ctx)
+		case <-pq.notifyCh:
+			if pq.isHeadSessionBoosted() {
+				klog.V(4).Info("[SessionBoost] grace period: session-boosted request arrived, dequeuing immediately")
+				pq.tryBackpressureDequeue(ctx)
 				return
 			}
 		case <-timer.C:
-			q.tryBackpressureDequeue(ctx)
+			pq.tryBackpressureDequeue(ctx)
 			return
 		}
 	}
@@ -473,120 +302,47 @@ func (q *SessionBoostQueue) waitGraceAndDequeue(ctx context.Context) {
 // stopping when the inflight limit is reached, backends report no capacity, or
 // the queue is empty. This avoids the one-request-per-tick bottleneck during
 // initial ramp-up and whenever spare capacity exists.
-func (q *SessionBoostQueue) tryBackpressureDequeue(ctx context.Context) {
-	perPod := q.config.InflightPerPod
-	if perPod <= 0 {
-		perPod = 1
-	}
-	maxInflight := int64(perPod)
-	podCount := 0
-	if q.podCounter != nil {
-		podCount = q.podCounter()
-		if podCount > 0 {
-			maxInflight = int64(podCount) * int64(perPod)
-		}
+func (pq *RequestPriorityQueue) tryBackpressureDequeue(ctx context.Context) {
+	// In session-boost mode, MaxConcurrent is the global (total) inflight limit.
+	// Operators size it from the estimated per-pod concurrency and pod count.
+	maxInflight := int64(pq.config.MaxConcurrent)
+	if maxInflight <= 0 {
+		maxInflight = int64(defaultSessionBoostMaxConcurrent)
 	}
 
 	for {
-		currentInflight := q.inflightCount.Load()
+		currentInflight := pq.inflightCount.Load()
 
 		if currentInflight >= maxInflight {
-			klog.V(4).Infof("[SessionBoostQueue] backpressure: inflight limit reached, inflight=%d maxInflight=%d pods=%d perPod=%d",
-				currentInflight, maxInflight, podCount, perPod)
+			klog.V(4).Infof("[SessionBoost] backpressure: inflight limit reached, inflight=%d maxInflight=%d",
+				currentInflight, maxInflight)
 			return
 		}
 
-		if !q.backendChecker() {
-			q.mu.RLock()
-			queueLen := q.heap.Len()
-			q.mu.RUnlock()
-			klog.V(4).Infof("[SessionBoostQueue] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d pods=%d",
-				queueLen, currentInflight, podCount)
+		if !pq.backendChecker() {
+			pq.mu.RLock()
+			queueLen := len(pq.heap)
+			pq.mu.RUnlock()
+			klog.V(4).Infof("[SessionBoost] backpressure: backend pods busy, holding dequeue. queueLen=%d inflight=%d",
+				queueLen, currentInflight)
 			return
 		}
 
-		q.mu.RLock()
-		queueLen := q.heap.Len()
-		q.mu.RUnlock()
+		pq.mu.RLock()
+		queueLen := len(pq.heap)
+		pq.mu.RUnlock()
 		if queueLen == 0 {
 			return
 		}
 
-		req, err := q.popWhenAvailable(ctx)
+		req, err := pq.popWhenAvailable(ctx)
 		if err != nil || req == nil {
 			return
 		}
 
-		q.inflightCount.Add(1)
-		releaseOnce := sync.Once{}
-		req.Release = func() {
-			releaseOnce.Do(func() {
-				q.inflightCount.Add(-1)
-				select {
-				case q.releaseCh <- struct{}{}:
-				default:
-				}
-				if q.metrics != nil {
-					q.metrics.DecSessionBoostQueueInflight(req.ModelName)
-				}
-			})
-		}
-		if q.metrics != nil {
-			q.metrics.IncSessionBoostQueueInflight(req.ModelName)
-		}
+		pq.admitSessionBoost(req)
 
-		klog.V(4).Infof("[SessionBoostQueue] backpressure dequeue: reqID=%s user=%s model=%s sessionBoost=%v inflight=%d/%d",
-			req.ReqID, req.UserID, req.ModelName, req.SessionBoost, q.inflightCount.Load(), maxInflight)
-
-		if req.NotifyChan != nil {
-			close(req.NotifyChan)
-		}
+		klog.V(4).Infof("[SessionBoost] backpressure dequeue: reqID=%s user=%s model=%s sessionBoost=%v inflight=%d/%d",
+			req.ReqID, req.UserID, req.ModelName, req.SessionBoost, pq.inflightCount.Load(), maxInflight)
 	}
-}
-
-// Close stops the dequeue loop and drains pending items.
-func (q *SessionBoostQueue) Close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	select {
-	case <-q.stopCh:
-		return
-	default:
-		close(q.stopCh)
-	}
-
-	for q.heap.Len() > 0 {
-		req := heap.Pop(&q.heap).(*Request)
-		if q.metrics != nil {
-			q.metrics.DecSessionBoostQueueSize(req.ModelName)
-		}
-	}
-	klog.V(4).Info("[SessionBoostQueue] queue closed and drained")
-}
-
-// MarkSessionCompleted records that a request from the given session has completed.
-func (q *SessionBoostQueue) MarkSessionCompleted(sessionID string) {
-	q.sessionTracker.MarkCompleted(sessionID)
-}
-
-// GetSessionTracker returns the session tracker.
-func (q *SessionBoostQueue) GetSessionTracker() *SessionTracker {
-	return q.sessionTracker
-}
-
-// SetPodCounter sets the function used to determine the number of ready backend pods.
-func (q *SessionBoostQueue) SetPodCounter(counter func() int) {
-	q.podCounter = counter
-}
-
-// GetInflightCount returns the current number of inflight requests.
-func (q *SessionBoostQueue) GetInflightCount() int64 {
-	return q.inflightCount.Load()
-}
-
-// Len returns the current queue length.
-func (q *SessionBoostQueue) Len() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return q.heap.Len()
 }

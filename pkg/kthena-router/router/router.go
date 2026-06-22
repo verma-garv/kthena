@@ -96,6 +96,12 @@ func (r *Router) ActiveRequestCount() int64 {
 }
 
 func NewRouter(store datastore.Store, routerConfigPath string) *Router {
+	// Session boost is a mode of the fairness queue and requires fairness
+	// scheduling to be enabled. Warn if it is requested on its own.
+	if EnableSessionBoost && !EnableFairnessScheduling {
+		klog.Warningf("ENABLE_SESSION_BOOST=true requires ENABLE_FAIRNESS_SCHEDULING=true; session boost will be ignored")
+	}
+
 	// Create a unified rate limiter for all models
 	loadRateLimiter := ratelimit.NewTokenRateLimiter()
 
@@ -318,23 +324,16 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 		// Store metrics recorder in context for use in other functions
 		c.Set("metricsRecorder", metricsRecorder)
 
-		// step 3.1: load balancing
-		if !EnableFairnessScheduling && !EnableSessionBoost {
+		// step 3.1: direct load balancing when fairness scheduling is disabled.
+		// Session boost is a mode of the fairness queue and has no effect unless
+		// fairness scheduling is enabled.
+		if !EnableFairnessScheduling {
 			r.doLoadbalance(c, modelRequest)
 			return
 		}
 
-		// step 3.2: standalone session boost (without fairness scheduling)
-		if EnableSessionBoost && !EnableFairnessScheduling {
-			if err := r.handleSessionBoostScheduling(c, modelRequest, requestID, modelName); err != nil {
-				accesslog.SetError(c, "scheduling", err.Error())
-				c.Set("finishReason", "scheduling")
-				return
-			}
-			return
-		}
-
-		// step 3.3: load balancing for Fairness scheduling enabled case
+		// step 3.2: fairness queue scheduling. When session boost is enabled, the
+		// queue orders requests by session boost instead of per-user fairness.
 		if err := r.handleFairnessScheduling(c, modelRequest, requestID, modelName); err != nil {
 			accesslog.SetError(c, "scheduling", err.Error())
 			c.Set("finishReason", "scheduling")
@@ -1096,7 +1095,11 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 	defer cancel()
 
 	var pri float64
-	if userId != "" {
+	if EnableSessionBoost {
+		// In session-boost mode the queue orders by session boost, not per-user
+		// priority, so skip the token-tracker priority computation entirely.
+		pri = 0
+	} else if userId != "" {
 		pri = r.calculateRequestPriority(userId, modelName)
 	} else {
 		// Assign lowest priority to unauthenticated requests so they don't
@@ -1150,84 +1153,5 @@ func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequ
 			requestID, sessionID, userId, modelName)
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, "Client disconnected while waiting in fairness queue")
 		return fmt.Errorf("client disconnected while waiting in fairness queue")
-	}
-}
-
-// handleSessionBoostScheduling handles the session boost queue scheduling flow.
-// This works independently of fairness scheduling, using session identification
-// to boost multi-turn conversation requests for prefix cache utilization.
-func (r *Router) handleSessionBoostScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
-	sessionHeader := r.store.GetSessionIDHeader()
-	var sessionID string
-	if sessionHeader != "" {
-		sessionID = c.Request.Header.Get(sessionHeader)
-	}
-	if headerReqID := c.Request.Header.Get("X-Request-ID"); headerReqID != "" {
-		requestID = headerReqID
-	}
-
-	var userId string
-	if userIdVal, ok := c.Get(common.UserIdKey); ok {
-		if s, ok := userIdVal.(string); ok {
-			userId = s
-		}
-	}
-
-	klog.V(4).Infof("[SessionBoost] incoming request: reqID=%s user=%s model=%s sessionID=%s",
-		requestID, userId, modelName, sessionID)
-
-	reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.fairnessTimeout)
-	defer cancel()
-
-	queueReq := &datastore.Request{
-		ReqID:       requestID,
-		UserID:      userId,
-		ModelName:   modelName,
-		SessionID:   sessionID,
-		RequestTime: time.Now(),
-		NotifyChan:  make(chan struct{}),
-		CancelCh:    reqCtx.Done(),
-	}
-
-	enqueued, err := r.store.EnqueueSessionBoost(queueReq)
-	if err != nil {
-		klog.Errorf("[SessionBoost] failed to enqueue: reqID=%s sessionID=%s model=%s err=%v",
-			requestID, sessionID, modelName, err)
-		c.AbortWithStatusJSON(http.StatusInternalServerError, fmt.Sprintf("failed to enqueue request: %v", err))
-		return fmt.Errorf("failed to enqueue request: %v", err)
-	}
-	if !enqueued {
-		// Session boost queue not enabled, fall through to direct load balance
-		r.doLoadbalance(c, modelRequest)
-		return nil
-	}
-
-	select {
-	case <-queueReq.NotifyChan:
-		if queueReq.Release != nil {
-			defer queueReq.Release()
-		}
-		klog.V(4).Infof("[SessionBoost] request dequeued: reqID=%s user=%s model=%s sessionBoost=%v waitTime=%v",
-			requestID, userId, modelName, queueReq.SessionBoost, time.Since(queueReq.RequestTime))
-		r.doLoadbalance(c, modelRequest)
-
-		if sessionID != "" {
-			r.store.MarkSessionCompleted(modelName, sessionID)
-		}
-		return nil
-	case <-reqCtx.Done():
-		if queueReq.Release != nil {
-			queueReq.Release()
-		}
-		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
-			klog.Errorf("[SessionBoost] request timed out in queue: reqID=%s sessionID=%s model=%s timeout=%v",
-				requestID, sessionID, modelName, r.fairnessTimeout)
-			c.AbortWithStatusJSON(http.StatusGatewayTimeout, "Request processing timed out")
-			return fmt.Errorf("request processing timed out in session boost queue")
-		}
-		klog.V(4).Infof("[SessionBoost] request cancelled (client disconnected): reqID=%s sessionID=%s model=%s",
-			requestID, sessionID, modelName)
-		c.AbortWithStatusJSON(http.StatusServiceUnavailable, "Client disconnected while waiting in session boost queue")
-		return fmt.Errorf("client disconnected while waiting in session boost queue")
 	}
 }
