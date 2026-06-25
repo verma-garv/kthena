@@ -488,8 +488,10 @@ type DisaggregatedTarget struct {
 	TargetRef corev1.ObjectReference `json:"targetRef"`
 
 	// Roles defines per-role scaling parameters. The map key is roleName
-	// from ModelServing.spec.template.roles[].name.
-	// +kubebuilder:validation:MinProperties=2
+	// from ModelServing.spec.template.roles[].name. A single role is allowed so
+	// users can autoscale one role independently without configuring a P/D pair.
+	// RatioConstraint, when set, still requires two distinct roles.
+	// +kubebuilder:validation:MinProperties=1
 	Roles map[string]RoleScalingParam `json:"roles"`
 
 	// RatioConstraint defines the acceptable ratio range of a single role pair.
@@ -517,7 +519,8 @@ type RoleScalingParam struct {
 	// spec.metrics (policy-level) and per-role metrics are MUTUALLY EXCLUSIVE:
 	// either set spec.metrics to scale every role on the same signals, or set
 	// metrics on every role here and leave spec.metrics empty. They must not
-	// both be set.
+	// both be set. A fixed role (minReplicas == maxReplicas) may omit metrics;
+	// the autoscaler keeps it at that fixed size and does not collect metrics for it.
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	Metrics []AutoscalingPolicyMetric `json:"metrics,omitempty"`

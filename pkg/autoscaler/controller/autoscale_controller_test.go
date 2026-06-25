@@ -233,6 +233,151 @@ func toInt32(s string) int32  { v, _ := strconv.Atoi(s); return int32(v) }
 type autoscalerAutoscaler = autoscaler.Autoscaler
 type autoscalerOptimizer = autoscaler.Optimizer
 
+func TestDoDisaggregatedScale_RatioRaisesDecode(t *testing.T) {
+	ns := "ns"
+	ms := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "ms-pd", Namespace: ns},
+		Spec: workload.ModelServingSpec{
+			Template: workload.ServingGroup{Roles: []workload.Role{
+				{Name: "prefill", Replicas: ptrInt32(1)},
+				{Name: "decode", Replicas: ptrInt32(2)},
+			}},
+		},
+	}
+
+	srv := httptest.NewServer(httpHandlerWithBody("# TYPE prefill_load gauge\nprefill_load 6\n# TYPE decode_load gauge\ndecode_load 2\n"))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port := toInt32(portStr)
+
+	policy := &workload.AutoscalingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "ap-pd", Namespace: ns, Generation: 1},
+		Spec: workload.AutoscalingPolicySpec{
+			TolerancePercent: 0,
+			DisaggregatedTarget: &workload.DisaggregatedTarget{
+				TargetRef: corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "ms-pd"},
+				Roles: map[string]workload.RoleScalingParam{
+					"prefill": {
+						MinReplicas: 1,
+						MaxReplicas: 8,
+						Metrics:     []workload.AutoscalingPolicyMetric{{Name: "prefill_load", TargetValue: resource.MustParse("1")}},
+						MetricSources: map[string]workload.MetricSource{
+							"prefill_load": {Pod: &workload.PodMetricSource{Name: "prefill_load", Uri: u.Path, Port: port}},
+						},
+					},
+					"decode": {
+						MinReplicas: 2,
+						MaxReplicas: 16,
+						Metrics:     []workload.AutoscalingPolicyMetric{{Name: "decode_load", TargetValue: resource.MustParse("1")}},
+						MetricSources: map[string]workload.MetricSource{
+							"decode_load": {Pod: &workload.PodMetricSource{Name: "decode_load", Uri: u.Path, Port: port}},
+						},
+					},
+				},
+				RatioConstraint: &workload.RoleRatioConstraint{
+					NumeratorRole:   "prefill",
+					DenominatorRole: "decode",
+					MinRatio:        resource.MustParse("0.25"),
+					MaxRatio:        resource.MustParse("1"),
+				},
+			},
+		},
+	}
+
+	client := clientfake.NewSimpleClientset(ms.DeepCopy(), policy.DeepCopy())
+	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
+	pods := []*corev1.Pod{readyPod(ns, "pod-pd", host, map[string]string{
+		workload.ModelServingNameLabelKey: "ms-pd",
+		workload.EntryLabelKey:            "true",
+		workload.RoleLabelKey:             "prefill",
+	})}
+	ac := &AutoscaleController{
+		client:                 client,
+		modelServingLister:     msLister,
+		podsLister:             fakePodLister{podsByNs: map[string][]*corev1.Pod{ns: pods}},
+		scalerMap:              map[string]*autoscalerAutoscaler{},
+		optimizerMap:           map[string]*autoscalerOptimizer{},
+		disaggregatedScalerMap: map[string]*autoscaler.DisaggregatedAutoscaler{},
+	}
+
+	if err := ac.doDisaggregatedScale(context.Background(), policy); err != nil {
+		t.Fatalf("doDisaggregatedScale error: %v", err)
+	}
+	updated, err := client.WorkloadV1alpha1().ModelServings(ns).Get(context.Background(), "ms-pd", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated modelserving error: %v", err)
+	}
+	got := map[string]int32{}
+	for _, role := range updated.Spec.Template.Roles {
+		got[role.Name] = *role.Replicas
+	}
+	if got["prefill"] != 6 || got["decode"] != 6 {
+		t.Fatalf("expected ratio-adjusted replicas prefill=6 decode=6, got %#v", got)
+	}
+	updatedPolicy, err := client.WorkloadV1alpha1().AutoscalingPolicies(ns).Get(context.Background(), "ap-pd", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get updated policy error: %v", err)
+	}
+	if updatedPolicy.Status.DisaggregatedStatus == nil || !updatedPolicy.Status.DisaggregatedStatus.RatioAdjusted {
+		t.Fatalf("expected ratioAdjusted status, got %#v", updatedPolicy.Status.DisaggregatedStatus)
+	}
+	if updatedPolicy.Status.DisaggregatedStatus.RatioStatus == nil || updatedPolicy.Status.DisaggregatedStatus.RatioStatus.CurrentRatio != "1" {
+		t.Fatalf("expected current ratio 1, got %#v", updatedPolicy.Status.DisaggregatedStatus.RatioStatus)
+	}
+}
+
+func TestUpdateTargetRoleReplicas_UsesMinimalJSONPatch(t *testing.T) {
+	ns := "default"
+	ms := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-ms", Namespace: ns},
+		Spec: workload.ModelServingSpec{
+			Template: workload.ServingGroup{Roles: []workload.Role{
+				{
+					Name:          "prefill",
+					Replicas:      ptrInt32(1),
+					EntryTemplate: workload.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "model", Image: "model:v1", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.2")}}}}}},
+				},
+				{
+					Name:          "decode",
+					Replicas:      ptrInt32(2),
+					EntryTemplate: workload.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "model", Image: "model:v1", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.5")}}}}}},
+				},
+			}},
+		},
+	}
+	fakeClient := clientfake.NewSimpleClientset(ms.DeepCopy())
+	ac := &AutoscaleController{
+		client:             fakeClient,
+		modelServingLister: workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy())),
+	}
+	target := &workload.DisaggregatedTarget{TargetRef: corev1.ObjectReference{Kind: workload.ModelServingKind.Kind, Namespace: ns, Name: "test-ms"}}
+	if err := ac.updateTargetRoleReplicas(context.Background(), target, ns, map[string]int32{"prefill": 3, "decode": 4}); err != nil {
+		t.Fatalf("updateTargetRoleReplicas error: %v", err)
+	}
+
+	var patchAction k8stesting.PatchAction
+	for _, action := range fakeClient.Actions() {
+		if action.GetVerb() == "patch" {
+			patchAction = action.(k8stesting.PatchAction)
+			break
+		}
+	}
+	if patchAction == nil {
+		t.Fatal("expected patch action")
+	}
+	patchBody := string(patchAction.GetPatch())
+	forbiddenFields := []string{"cpu", "memory", "resources", "limits", "requests", "image", "containers", "entryTemplate"}
+	for _, field := range forbiddenFields {
+		if strings.Contains(patchBody, field) {
+			t.Fatalf("patch body contains forbidden field %q: %s", field, patchBody)
+		}
+	}
+	if !strings.Contains(patchBody, "/spec/template/roles/0/replicas") || !strings.Contains(patchBody, "/spec/template/roles/1/replicas") {
+		t.Fatalf("patch body does not update both role replicas: %s", patchBody)
+	}
+}
+
 func TestFormatAutoscalerMapKey_IncludesNamespaceAndTarget(t *testing.T) {
 	targetRef := &corev1.ObjectReference{Name: "same-target", Kind: workload.ModelServingKind.Kind}
 

@@ -220,7 +220,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `targetRef` _[ObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.33/#objectreference-v1-core)_ | TargetRef references the ModelServing deployment that contains<br />all scalable roles. |  |  |
-| `roles` _object (keys:string, values:[RoleScalingParam](#rolescalingparam))_ | Roles defines per-role scaling parameters. The map key is roleName<br />from ModelServing.spec.template.roles[].name. |  | MinProperties: 2 <br /> |
+| `roles` _object (keys:string, values:[RoleScalingParam](#rolescalingparam))_ | Roles defines per-role scaling parameters. The map key is roleName<br />from ModelServing.spec.template.roles[].name. A single role is allowed so<br />users can autoscale one role independently without configuring a P/D pair.<br />RatioConstraint, when set, still requires two distinct roles. |  | MinProperties: 1 <br /> |
 | `ratioConstraint` _[RoleRatioConstraint](#roleratioconstraint)_ | RatioConstraint defines the acceptable ratio range of a single role pair.<br />It enforces that replicas[numeratorRole] / replicas[denominatorRole] stays<br />within [minRatio, maxRatio] when denominator replica is non-zero. |  |  |
 
 
@@ -918,7 +918,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `minReplicas` _integer_ | MinReplicas defines the minimum number of replicas for this role. |  | Maximum: 1e+06 <br />Minimum: 0 <br /> |
 | `maxReplicas` _integer_ | MaxReplicas defines the maximum number of replicas for this role. |  | Maximum: 1e+06 <br />Minimum: 1 <br /> |
-| `metrics` _[AutoscalingPolicyMetric](#autoscalingpolicymetric) array_ | Metrics defines the list of metrics used to evaluate scaling decisions<br />for this role, allowing different roles to scale on different signals.<br />spec.metrics (policy-level) and per-role metrics are MUTUALLY EXCLUSIVE:<br />either set spec.metrics to scale every role on the same signals, or set<br />metrics on every role here and leave spec.metrics empty. They must not<br />both be set. |  | MinItems: 1 <br /> |
+| `metrics` _[AutoscalingPolicyMetric](#autoscalingpolicymetric) array_ | Metrics defines the list of metrics used to evaluate scaling decisions<br />for this role, allowing different roles to scale on different signals.<br />spec.metrics (policy-level) and per-role metrics are MUTUALLY EXCLUSIVE:<br />either set spec.metrics to scale every role on the same signals, or set<br />metrics on every role here and leave spec.metrics empty. They must not<br />both be set. A fixed role (minReplicas == maxReplicas) may omit metrics;<br />the autoscaler keeps it at that fixed size and does not collect metrics for it. |  | MinItems: 1 <br /> |
 | `metricSources` _object (keys:string, values:[MetricSource](#metricsource))_ | MetricSources declares how each metric is fetched for this role.<br />Keys must match role-level metrics when present, otherwise top-level<br />spec.metrics[].name.<br />Missing keys are treated as missing metrics for that reconcile loop. |  |  |
 
 
