@@ -6,7 +6,7 @@ This guide explains what session boost does, when to use it, how to enable it, a
 
 ## Overview
 
-Modern LLM inference engines like vLLM maintain a **prefix cache** (KV cache) that stores previously computed key-value attention states. In multi-turn conversations, each follow-up message shares a large prefix with the previous turn. If the follow-up request is processed shortly after the prior turn completes, the prefix cache is still warm, and the engine can skip recomputing attention for the shared prefix—reducing TTFT by 50–80%.
+Modern LLM inference engines like vLLM maintain a **prefix cache** (KV cache) that stores previously computed key-value attention states. In multi-turn conversations, each follow-up message shares a large prefix with the previous turn. If the follow-up request is processed shortly after the prior turn completes, the prefix cache is still warm, and the engine can skip recomputing attention for the shared prefix—substantially reducing TTFT.
 
 Without session boost, a follow-up request may be queued behind unrelated requests. By the time it reaches the backend, the prefix cache may have been evicted, forcing a full recomputation.
 
@@ -225,12 +225,14 @@ When a session boost is triggered, the router logs the event. Look for session b
 kubectl -n kthena-system logs deploy/kthena-router | grep -i "session boost"
 ```
 
-### 3. Compare TTFT With and Without Boost
+### 3. Compare TTFT Under Concurrent Multi-Turn Load
 
-Send a multi-turn conversation and measure TTFT for the second turn:
+A single multi-turn conversation will **not** reveal the benefit of session boost: its turns always reach the same backend pod and the prefix cache stays warm regardless of queue ordering. Session boost only matters when **many multi-turn conversations run concurrently** and contend for backend capacity—then queue ordering decides whether a follow-up is processed while its prefix cache is still warm or after it has been evicted by unrelated traffic.
 
-- **Without session boost**: TTFT for Turn 2 ≈ TTFT for Turn 1 (full prefix computation).
-- **With session boost**: TTFT for Turn 2 should be significantly lower (prefix cache hit).
+To observe the effect, generate concurrent load with multiple simultaneous multi-turn sessions (enough to keep the queue contended), then compare aggregate follow-up TTFT:
+
+- **Without session boost**: follow-up requests wait behind unrelated requests; by the time they reach the backend their prefix cache may have been evicted, so follow-up TTFT is high and variable.
+- **With session boost**: follow-up requests are promoted ahead of non-boosted requests and reach the backend while the prefix cache is still warm, lowering follow-up TTFT (especially p90/p99) under the same load.
 
 ## Operational Notes
 
