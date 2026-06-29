@@ -4142,6 +4142,67 @@ func TestScaleDownRoles(t *testing.T) {
 	}
 }
 
+func TestScaleDownRolesSkipsDeletingRolesWhenActiveCountMatchesExpected(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
+	kthenaClient := kthenafake.NewSimpleClientset()
+	volcanoClient := volcanofake.NewSimpleClientset()
+
+	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextfake.NewSimpleClientset())
+	assert.NoError(t, err)
+
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-role-scaledown-skip-deleting",
+		},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Replicas:      ptr.To[int32](1),
+			SchedulerName: "volcano",
+			Template: workloadv1alpha1.ServingGroup{
+				Roles: []workloadv1alpha1.Role{
+					{
+						Name:     "prefill",
+						Replicas: ptr.To[int32](2),
+						EntryTemplate: workloadv1alpha1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:  "prefill-container",
+										Image: "test-image:latest",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			RecoveryPolicy: workloadv1alpha1.RoleRecreate,
+		},
+	}
+
+	nsn := utils.GetNamespaceName(ms)
+	groupName := utils.GenerateServingGroupName(ms.Name, 0)
+	targetRole := ms.Spec.Template.Roles[0]
+	controller.store.AddServingGroup(nsn, 0, "test-revision")
+	assert.NoError(t, controller.store.UpdateServingGroupStatus(nsn, groupName, datastore.ServingGroupRunning))
+
+	for _, roleID := range []string{"prefill-0", "prefill-1"} {
+		controller.store.AddRole(nsn, groupName, "prefill", roleID, "test-revision", "test-roleTemplateHash")
+		assert.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "prefill", roleID, datastore.RoleRunning))
+	}
+	assert.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "prefill", "prefill-1", datastore.RoleDeleting))
+
+	roleList, err := controller.store.GetRoleList(nsn, groupName, "prefill")
+	assert.NoError(t, err)
+
+	controller.scaleDownRoles(context.Background(), ms, groupName, targetRole, roleList, 2)
+
+	assert.Equal(t, datastore.ServingGroupRunning, controller.store.GetServingGroupStatus(nsn, groupName))
+	assert.Equal(t, datastore.RoleRunning, controller.store.GetRoleStatus(nsn, groupName, "prefill", "prefill-0"))
+	assert.Equal(t, datastore.RoleRunning, controller.store.GetRoleStatus(nsn, groupName, "prefill", "prefill-1"))
+	assert.Equal(t, datastore.RoleDeleting, controller.store.GetRoleStatus(nsn, groupName, "prefill", "prefill-2"))
+}
+
 // TestScaleDownRolesWithPriorityAndDeletionCost tests the scaleDownRoles function with priority and deletion cost scenarios
 func TestScaleDownRolesWithPriorityAndDeletionCost(t *testing.T) {
 	tests := []struct {
