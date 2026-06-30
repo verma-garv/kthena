@@ -4186,11 +4186,11 @@ func TestScaleDownRolesSkipsDeletingRolesWhenActiveCountMatchesExpected(t *testi
 	controller.store.AddServingGroup(nsn, 0, "test-revision")
 	assert.NoError(t, controller.store.UpdateServingGroupStatus(nsn, groupName, datastore.ServingGroupRunning))
 
-	for _, roleID := range []string{"prefill-0", "prefill-1"} {
+	for _, roleID := range []string{"prefill-0", "prefill-1", "prefill-2"} {
 		controller.store.AddRole(nsn, groupName, "prefill", roleID, "test-revision", "test-roleTemplateHash")
 		assert.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "prefill", roleID, datastore.RoleRunning))
 	}
-	assert.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "prefill", "prefill-1", datastore.RoleDeleting))
+	assert.NoError(t, controller.store.UpdateRoleStatus(nsn, groupName, "prefill", "prefill-2", datastore.RoleDeleting))
 
 	roleList, err := controller.store.GetRoleList(nsn, groupName, "prefill")
 	assert.NoError(t, err)
@@ -4267,14 +4267,14 @@ func TestScaleDownRolesWithPriorityAndDeletionCost(t *testing.T) {
 			description:            "Not-ready status should take priority over deletion cost",
 		},
 		{
-			name:            "deletes not-found and deleting roles first then picks lowest cost among running",
+			name:            "skips deleting roles and deletes not-found roles first then picks lowest cost among running",
 			existingIndices: []int{0, 1, 2, 3, 4},
 			expectedCount:   2,
 			roleStatuses: map[int]datastore.RoleStatus{
 				0: datastore.RoleRunning,
 				1: datastore.RoleNotFound, // Not ready
 				2: datastore.RoleRunning,
-				3: datastore.RoleDeleting, // Not ready
+				3: datastore.RoleDeleting, // Already deleting, should be skipped
 				4: datastore.RoleRunning,
 			},
 			podDeletionCosts: map[int]int{
@@ -4284,8 +4284,8 @@ func TestScaleDownRolesWithPriorityAndDeletionCost(t *testing.T) {
 				3: 0,
 				4: 200, // Highest cost among ready roles
 			},
-			expectedRemainingNames: []string{"prefill-0", "prefill-4"}, // Roles 1,3 (not ready) and 2 (lowest cost among ready) deleted
-			description:            "Complex scenario with mixed status and costs",
+			expectedRemainingNames: []string{"prefill-0", "prefill-4"}, // Role 3 is already deleting; roles 1 and 2 are newly deleted
+			description:            "Complex scenario with mixed status and costs skips already deleting roles",
 		},
 		{
 			name:            "falls back to deleting higher indices when all roles are not ready",
@@ -4441,8 +4441,13 @@ func TestScaleDownRolesWithPriorityAndDeletionCost(t *testing.T) {
 			// Build the roleList to pass to scaleDownRoles
 			existingRoles := make([]datastore.Role, len(tt.existingIndices))
 			for i, ordinal := range tt.existingIndices {
+				status := datastore.RoleCreating
+				if roleStatus, exists := tt.roleStatuses[ordinal]; exists {
+					status = roleStatus
+				}
 				existingRoles[i] = datastore.Role{
-					Name: utils.GenerateRoleID("prefill", ordinal),
+					Name:   utils.GenerateRoleID("prefill", ordinal),
+					Status: status,
 				}
 			}
 
