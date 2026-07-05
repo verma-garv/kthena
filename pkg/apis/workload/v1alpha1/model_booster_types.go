@@ -56,7 +56,8 @@ type ModelBackend struct {
 	// Supported schemes:
 	//   hf://<namespace>/<repo>         — Hugging Face Hub repository
 	//   ms://<namespace>/<repo>         — ModelScope repository
-	//   s3://<bucket>/<path>            — S3-compatible object storage (also obs://)
+	//   s3://<bucket>/<path>            — S3-compatible object storage
+	//   obs://<bucket>/<path>           — Huawei Object Storage Service (OBS)
 	//   pvc:///<claimName>/<path>       — path inside a PVC already mounted via CacheURI
 	//
 	// When using pvc://, the downloader reads the given path from the container filesystem.
@@ -64,7 +65,7 @@ type ModelBackend struct {
 	// modelURI path must be reachable through that mount.  Both CacheURI and modelURI must
 	// reference the same PVC, and the modelURI path must start with the CacheURI mount point.
 	// Example: CacheURI: pvc://model-storage, ModelURI: pvc:///model-storage/models/Qwen
-	// +kubebuilder:validation:Pattern=`^(hf://|s3://|pvc://|ms://).+`
+	// +kubebuilder:validation:Pattern=`^(hf://|s3://|obs://|pvc://|ms://).+`
 	ModelURI string `json:"modelURI"`
 	// CacheURI specifies where the downloaded model is stored and how the storage volume is
 	// mounted inside every pod (both the downloader init container and the inference engine).
