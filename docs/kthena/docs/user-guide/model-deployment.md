@@ -484,7 +484,7 @@ For example, with `cacheURI: pvc://model-cache` and `modelURI: hf://Qwen/Qwen2.5
 |---|---|---|
 | `pvc://<claimName>` | Kubernetes PersistentVolumeClaim | `/<claimName>` |
 | `hostpath://<path>` | Host-local directory | `/<path>` |
-| *(omitted)* | Ephemeral EmptyDir (no persistence); no stable mount path — use `pvc://` or `hostpath://` for a usable cache | N/A |
+| *(omitted)* | *(currently not supported by ModelBooster; always specify `pvc://` or `hostpath://`)* | N/A |
 
 ### Configuration examples
 

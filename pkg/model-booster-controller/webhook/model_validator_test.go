@@ -173,18 +173,32 @@ func TestValidatePVCURICompatibility(t *testing.T) {
 			expectMsg:   "is not reachable via cacheURI mount",
 		},
 		{
-			name:        "pvc modelURI with path traversal is invalid",
+			name:        "pvc modelURI with mid-path traversal is invalid",
 			modelURI:    "pvc:///crater-storage/../other-pvc/models/Qwen",
 			cacheURI:    "pvc://crater-storage",
 			expectValid: false,
 			expectMsg:   "must not contain '..' path segments",
 		},
 		{
-			name:        "pvc modelURI with empty pvc cacheURI claim name is invalid",
+			name:        "pvc modelURI with leading path traversal is invalid",
+			modelURI:    "pvc://../other/models/Qwen",
+			cacheURI:    "pvc://crater-storage",
+			expectValid: false,
+			expectMsg:   "must not contain '..' path segments",
+		},
+		{
+			name:        "pvc cacheURI with empty claim name is invalid",
 			modelURI:    "pvc:///shared/models/Qwen",
 			cacheURI:    "pvc://",
 			expectValid: false,
-			expectMsg:   "cacheURI must specify a valid PVC claim name",
+			expectMsg:   "must contain a single PVC claim name with no path separator",
+		},
+		{
+			name:        "pvc cacheURI with slashed claim name is invalid",
+			modelURI:    "pvc:///foo/bar/models/Qwen",
+			cacheURI:    "pvc://foo/bar",
+			expectValid: false,
+			expectMsg:   "claim names cannot contain '/'",
 		},
 	}
 

@@ -214,15 +214,32 @@ func validatePVCURICompatibility(model *registryv1alpha1.ModelBooster) field.Err
 		return allErrs
 	}
 
-	// Explicitly reject ".." segments in the raw modelURI before any normalization.
-	// path.Clean (applied inside pvcModelSourcePath) would resolve them silently, but a URI
-	// containing ".." is almost certainly a misconfiguration and should be rejected clearly.
+	// Reject any ".." segment at any position in the raw modelURI path.
+	// Checking each segment (rather than specific substrings) catches leading ".."
+	// e.g. pvc://../other, which has no "/../" substring but still escapes the mount.
 	rawPVCPath := strings.TrimPrefix(backend.ModelURI, "pvc://")
-	if strings.Contains(rawPVCPath, "/../") || strings.HasSuffix(rawPVCPath, "/..") || rawPVCPath == ".." {
+	for _, seg := range strings.Split(rawPVCPath, "/") {
+		if seg == ".." {
+			allErrs = append(allErrs, field.Invalid(
+				backendPath.Child("modelURI"),
+				backend.ModelURI,
+				"pvc:// modelURI must not contain '..' path segments",
+			))
+			return allErrs
+		}
+	}
+
+	// Validate that cacheURI contains exactly a PVC claim name with no slashes.
+	// PVC names are Kubernetes DNS labels and cannot contain '/'.  A slashed claim
+	// name (e.g. pvc://foo/bar) would pass the mount-path prefix check but make
+	// buildCacheVolume set ClaimName to "foo/bar", causing pod creation to fail.
+	claimName := strings.Trim(strings.TrimPrefix(backend.CacheURI, "pvc://"), "/")
+	if claimName == "" || strings.Contains(claimName, "/") {
 		allErrs = append(allErrs, field.Invalid(
-			backendPath.Child("modelURI"),
-			backend.ModelURI,
-			"pvc:// modelURI must not contain '..' path segments",
+			backendPath.Child("cacheURI"),
+			backend.CacheURI,
+			"pvc:// cacheURI must contain a single PVC claim name with no path separator "+
+				"(e.g. pvc://<claimName>); claim names cannot contain '/'",
 		))
 		return allErrs
 	}
@@ -231,15 +248,7 @@ func validatePVCURICompatibility(model *registryv1alpha1.ModelBooster) field.Err
 	// pvcModelSourcePath applies path.Clean so the normalized paths are canonical
 	// before the prefix check.
 	sourcePath := pvcModelSourcePath(backend.ModelURI)
-	mountPath := cacheVolumeMountPath(backend.CacheURI)
-	if mountPath == "" {
-		allErrs = append(allErrs, field.Invalid(
-			backendPath.Child("cacheURI"),
-			backend.CacheURI,
-			"cacheURI must specify a valid PVC claim name (e.g. pvc://<claimName>)",
-		))
-		return allErrs
-	}
+	mountPath := "/" + claimName
 	if sourcePath != mountPath && !strings.HasPrefix(sourcePath, mountPath+"/") {
 		allErrs = append(allErrs, field.Invalid(
 			backendPath.Child("modelURI"),
