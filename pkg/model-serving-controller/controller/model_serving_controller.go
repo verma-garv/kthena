@@ -971,10 +971,13 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		return
 	}
 
-	var roleTemplateHash string
 	expectedCount := int(*targetRole.Replicas)
 	expectedPods := 1 + int(targetRole.WorkerReplicas)
-	for _, roleObj := range roleList {
+	partition, partitionConfigured, partitionErr := utils.GetPartitionForRole(targetRole)
+	if partitionErr != nil {
+		klog.Errorf("manageRoleReplicasPerGroup: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
+	}
+	for index, roleObj := range roleList {
 		if roleObj.Status == datastore.RoleDeleting {
 			continue
 		}
@@ -995,11 +998,10 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		}
 		if len(pods) < expectedPods {
 			klog.V(2).Infof("manageRoleReplicasPerGroup: role %s/%s in ServingGroup %s is missing pods (%d/%d), recreating", targetRole.Name, roleObj.Name, groupName, len(pods), expectedPods)
-			if roleTemplateHash == "" {
-				roleTemplateHash = utils.CalRoleTemplateHash(targetRole)
-			}
+			partitionProtected := partitionConfigured && partition > 0 && index < partition
+			roleToApply, revisionToUse, hashToUse := c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, newRevision, partitionProtected)
 			_, roleIndex := utils.GetParentNameAndOrdinal(roleObj.Name)
-			if err := c.CreatePodsByRole(ctx, *targetRole.DeepCopy(), ms, roleIndex, servingGroupOrdinal, newRevision, roleTemplateHash); err != nil {
+			if err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), ms, roleIndex, servingGroupOrdinal, revisionToUse, hashToUse); err != nil {
 				klog.Errorf("manageRoleReplicasPerGroup: failed to recreate pods for role %s/%s in ServingGroup %s: %v", targetRole.Name, roleObj.Name, groupName, err)
 			}
 		}
@@ -1013,6 +1015,56 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		klog.V(2).Infof("manageRoleReplicasPerGroup: scaling DOWN role %s in ServingGroup %s: current=%d, expected=%d", targetRole.Name, groupName, len(roleList), expectedCount)
 		c.scaleDownRoles(ctx, ms, groupName, targetRole, roleList, expectedCount)
 	}
+}
+
+// roleTemplateForReplica resolves the role template, revision, and hash to use when recreating pods for a replica.
+// Partition-protected replicas keep the revision recorded on the role (or CurrentRevision) and load the old template from ControllerRevision.
+func (c *ModelServingController) roleTemplateForReplica(
+	ctx context.Context,
+	ms *workloadv1alpha1.ModelServing,
+	targetRole workloadv1alpha1.Role,
+	roleObj datastore.Role,
+	newRevision string,
+	partitionProtected bool,
+) (workloadv1alpha1.Role, string, string) {
+	roleToApply := targetRole
+	revisionToUse := newRevision
+	hashToUse := ""
+	if !partitionProtected {
+		return roleToApply, revisionToUse, utils.CalRoleTemplateHash(roleToApply)
+	}
+
+	revisionToUse = roleObj.Revision
+	if revisionToUse == "" {
+		revisionToUse = ms.Status.CurrentRevision
+	}
+	hashToUse = roleObj.RoleTemplateHash
+	if revisionToUse == "" {
+		if hashToUse == "" {
+			hashToUse = utils.CalRoleTemplateHash(roleToApply)
+		}
+		return roleToApply, revisionToUse, hashToUse
+	}
+
+	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
+	if err != nil {
+		klog.Warningf("roleTemplateForReplica: failed to get ControllerRevision %s for partition-protected role %s: %v", revisionToUse, roleObj.Name, err)
+	} else if cr != nil {
+		if oldRoles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
+			klog.Warningf("roleTemplateForReplica: failed to get roles from ControllerRevision %s for partition-protected role %s: %v", revisionToUse, roleObj.Name, err)
+		} else {
+			for _, oldRole := range oldRoles {
+				if oldRole.Name == targetRole.Name {
+					roleToApply = oldRole
+					break
+				}
+			}
+		}
+	}
+	if hashToUse == "" {
+		hashToUse = utils.CalRoleTemplateHash(roleToApply)
+	}
+	return roleToApply, revisionToUse, hashToUse
 }
 
 // emitRoleStatusEvent emits a Kubernetes Event for a role-related status change.
@@ -1308,6 +1360,27 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 		}
 
 		outdatedRoles, newUnavailable := c.outdatedRoles(ms, sg, roleSpec, roleList)
+		partition, partitionConfigured, partitionErr := utils.GetPartitionForRole(roleSpec)
+		if partitionErr != nil {
+			return nil, false, fmt.Errorf("failed to parse partition for role %s: %v", roleSpec.Name, partitionErr)
+		}
+		if partitionConfigured && partition > 0 && len(outdatedRoles) > 0 {
+			protected := make(map[string]struct{}, partition)
+			for index, role := range roleList {
+				if index >= partition {
+					break
+				}
+				protected[role.Name] = struct{}{}
+			}
+			filtered := outdatedRoles[:0]
+			for _, r := range outdatedRoles {
+				if _, ok := protected[r.Name]; ok {
+					continue
+				}
+				filtered = append(filtered, r)
+			}
+			outdatedRoles = filtered
+		}
 		if len(outdatedRoles) == 0 {
 			continue
 		}

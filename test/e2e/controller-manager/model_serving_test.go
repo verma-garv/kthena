@@ -2105,9 +2105,11 @@ func TestModelServingRoleRollingUpdateMaxUnavailable(t *testing.T) {
 			Template: workload.ServingGroup{
 				Roles: []workload.Role{
 					{
-						Name:           "prefill",
-						Replicas:       &prefillReplicas,
-						MaxUnavailable: &maxUnavailable,
+						Name:     "prefill",
+						Replicas: &prefillReplicas,
+						RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+							MaxUnavailable: &maxUnavailable,
+						},
 						EntryTemplate: workload.PodTemplateSpec{
 							Spec: corev1.PodSpec{
 								Containers: []corev1.Container{{
@@ -2208,6 +2210,184 @@ func TestModelServingRoleRollingUpdateMaxUnavailable(t *testing.T) {
 			"RoleRollingUpdate should not exceed role maxUnavailable while updated pods are unavailable")
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// TestModelServingRoleRollingUpdatePartition verifies RoleRollingUpdate respects role-level partition
+// when role ordinals do not start from 0. Partition protects the first N replicas in the sorted role list
+// (e.g. prefill-4 and prefill-5), not replicas whose ordinal is less than partition.
+func TestModelServingRoleRollingUpdatePartition(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	replicas := int32(1)
+	initialRoleReplicas := int32(8)
+	targetRoleReplicas := int32(4)
+	partition := int32(2)
+	protectedOrdinals := []int32{4, 5}
+
+	modelServing := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-role-rolling-partition",
+			Namespace: testNamespace,
+		},
+		Spec: workload.ModelServingSpec{
+			Replicas:       &replicas,
+			RecoveryPolicy: workload.RoleRecreate,
+			RolloutStrategy: &workload.RolloutStrategy{
+				Type: workload.RoleRollingUpdate,
+			},
+			Template: workload.ServingGroup{
+				Roles: []workload.Role{
+					{
+						Name:     "prefill",
+						Replicas: &initialRoleReplicas,
+						RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+							Partition:      ptr.To(intstr.FromInt32(partition)),
+							MaxUnavailable: ptr.To(intstr.FromInt(int(targetRoleReplicas))),
+						},
+						EntryTemplate: workload.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:  "test-container",
+									Image: nginxImage,
+									Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 80}},
+								}},
+							},
+						},
+						WorkerReplicas: 0,
+					},
+				},
+			},
+		},
+	}
+
+	selector := fmt.Sprintf("%s,%s=prefill,%s=%s", modelServingLabelSelector(modelServing.Name), workload.RoleLabelKey, workload.EntryLabelKey, controllerutils.Entry)
+
+	t.Logf("Creating ModelServing with %d prefill replicas for RoleRollingUpdate partition test", initialRoleReplicas)
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, int(initialRoleReplicas), 3*time.Minute)
+
+	initialPods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	require.NoError(t, err)
+	require.Len(t, initialPods.Items, int(initialRoleReplicas))
+	for _, pod := range initialPods.Items {
+		roleID := pod.Labels[workload.RoleIDKey]
+		_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+		patchPodDeletionCost(t, ctx, kubeClient, pod.Name, ordinal*100)
+	}
+
+	scaleDownMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	scaleDownMS = scaleDownMS.DeepCopy()
+	scaleDownMS.Spec.Template.Roles[0].Replicas = &targetRoleReplicas
+	t.Logf("Scaling down prefill role from %d to %d replicas; expect ordinals 4-7 to remain", initialRoleReplicas, targetRoleReplicas)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, int(targetRoleReplicas), 3*time.Minute)
+
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil || len(pods.Items) != int(targetRoleReplicas) {
+			return false
+		}
+		ordinals := make(map[int32]bool, targetRoleReplicas)
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			ordinals[int32(ordinal)] = true
+		}
+		for _, ord := range protectedOrdinals {
+			if !ordinals[ord] {
+				t.Logf("Missing prefill replica with ordinal %d after scale down", ord)
+				return false
+			}
+		}
+		return len(ordinals) == int(targetRoleReplicas)
+	}, 3*time.Minute, 2*time.Second, "prefill role ordinals should be 4-7 after scale down")
+
+	oldImageByOrdinal := map[int32]string{}
+	scaledPods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	require.NoError(t, err)
+	for _, pod := range scaledPods.Items {
+		if pod.DeletionTimestamp != nil || len(pod.Spec.Containers) == 0 {
+			continue
+		}
+		roleID := pod.Labels[workload.RoleIDKey]
+		_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+		oldImageByOrdinal[int32(ordinal)] = pod.Spec.Containers[0].Image
+	}
+	for _, ord := range protectedOrdinals {
+		require.Equal(t, nginxImage, oldImageByOrdinal[ord], "prefill-%d should use nginxImage before update", ord)
+	}
+	require.Len(t, oldImageByOrdinal, int(targetRoleReplicas))
+
+	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	updatedMS := initialMS.DeepCopy()
+	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+
+	t.Logf("Updating prefill role image to %s; partition=%d should keep prefill-4/5 on old image", nginxAlpineImage, partition)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			t.Logf("Failed to list prefill entry pods: %v", err)
+			return false
+		}
+		if len(pods.Items) != int(targetRoleReplicas) {
+			t.Logf("Prefill pod count=%d, expecting %d", len(pods.Items), targetRoleReplicas)
+			return false
+		}
+
+		imageByOrdinal := map[int32]string{}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || len(pod.Spec.Containers) == 0 {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			imageByOrdinal[int32(ordinal)] = pod.Spec.Containers[0].Image
+		}
+		if len(imageByOrdinal) != int(targetRoleReplicas) {
+			t.Logf("Observed ordinals=%d, expecting %d", len(imageByOrdinal), targetRoleReplicas)
+			return false
+		}
+
+		for _, ord := range protectedOrdinals {
+			if imageByOrdinal[ord] != nginxImage {
+				t.Logf("Protected prefill-%d image=%s, expecting old image=%s", ord, imageByOrdinal[ord], nginxImage)
+				return false
+			}
+		}
+		updatedCorrect := 0
+		for ord, img := range imageByOrdinal {
+			isProtected := false
+			for _, protected := range protectedOrdinals {
+				if ord == protected {
+					isProtected = true
+					break
+				}
+			}
+			if isProtected {
+				continue
+			}
+			if img != nginxAlpineImage {
+				t.Logf("Updatable prefill-%d image=%s, expecting new image=%s", ord, img, nginxAlpineImage)
+				return false
+			}
+			updatedCorrect++
+		}
+		if updatedCorrect != int(targetRoleReplicas-partition) {
+			t.Logf("Updated replicas=%d, expecting %d", updatedCorrect, targetRoleReplicas-partition)
+			return false
+		}
+		return true
+	}, 3*time.Minute, 2*time.Second, "RoleRollingUpdate partition state did not converge")
 }
 
 // TestModelServingBinPackScaleDownServingGroup tests bin pack scale down at ServingGroup level

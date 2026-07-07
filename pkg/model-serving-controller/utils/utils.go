@@ -602,13 +602,27 @@ func GetMaxUnavailable(ms *workloadv1alpha1.ModelServing) (int, error) {
 }
 
 func GetMaxUnavailableForRole(role workloadv1alpha1.Role) (int, bool, error) {
-	if role.MaxUnavailable == nil {
+	if role.RollingUpdateConfiguration == nil || role.RollingUpdateConfiguration.MaxUnavailable == nil {
 		return 0, false, nil
 	}
 	replicas := 1
 	if role.Replicas != nil {
 		replicas = int(*role.Replicas)
 	}
-	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(role.MaxUnavailable, replicas, false)
+	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(role.RollingUpdateConfiguration.MaxUnavailable, replicas, false)
 	return maxUnavailable, true, err
+}
+
+// GetPartitionForRole returns the partition value for a RoleRollingUpdate, or 0 if not set.
+// If the partition is specified as a percentage, it is calculated from role replicas (rounded up).
+func GetPartitionForRole(role workloadv1alpha1.Role) (int, bool, error) {
+	if role.RollingUpdateConfiguration == nil || role.RollingUpdateConfiguration.Partition == nil {
+		return 0, false, nil
+	}
+	replicas := 1
+	if role.Replicas != nil {
+		replicas = int(*role.Replicas)
+	}
+	partition, err := intstr.GetScaledValueFromIntOrPercent(role.RollingUpdateConfiguration.Partition, replicas, true)
+	return partition, true, err
 }

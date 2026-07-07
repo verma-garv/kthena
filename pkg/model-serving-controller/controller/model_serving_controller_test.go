@@ -6880,9 +6880,11 @@ func TestDeleteOutdatedRolesForRoleRollingUpdateWithMaxUnavailable(t *testing.T)
 					Template: workloadv1alpha1.ServingGroup{
 						Roles: []workloadv1alpha1.Role{
 							{
-								Name:           "decode",
-								Replicas:       ptr.To[int32](4),
-								MaxUnavailable: tt.maxUnavailable,
+								Name:     "decode",
+								Replicas: ptr.To[int32](4),
+								RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+									MaxUnavailable: tt.maxUnavailable,
+								},
 								EntryTemplate: workloadv1alpha1.PodTemplateSpec{
 									Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "nginx"}}},
 								},
@@ -6929,9 +6931,11 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 
 	newRole := func(name, image string, replicas int32, maxUnavailable *intstr.IntOrString) workloadv1alpha1.Role {
 		return workloadv1alpha1.Role{
-			Name:           name,
-			Replicas:       ptr.To(replicas),
-			MaxUnavailable: maxUnavailable,
+			Name:     name,
+			Replicas: ptr.To(replicas),
+			RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+				MaxUnavailable: maxUnavailable,
+			},
 			EntryTemplate: workloadv1alpha1.PodTemplateSpec{
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: image}}},
 			},

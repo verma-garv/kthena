@@ -909,10 +909,10 @@ func (in *Role) DeepCopyInto(out *Role) {
 		*out = new(PodTemplateSpec)
 		(*in).DeepCopyInto(*out)
 	}
-	if in.MaxUnavailable != nil {
-		in, out := &in.MaxUnavailable, &out.MaxUnavailable
-		*out = new(intstr.IntOrString)
-		**out = **in
+	if in.RollingUpdateConfiguration != nil {
+		in, out := &in.RollingUpdateConfiguration, &out.RollingUpdateConfiguration
+		*out = new(RollingUpdateConfiguration)
+		(*in).DeepCopyInto(*out)
 	}
 }
 
