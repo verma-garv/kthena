@@ -867,9 +867,11 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 // When partition is set, the first N replicas (where N = partition) are protected.
 // Non-protected replicas (after the first N) are deleted first, then protected replicas if needed.
 func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int) {
+	// Calculate priority information for all Roles
 	allScores := make([]RoleWithScore, 0, len(roleList))
 	for _, role := range roleList {
 		if role.Status == datastore.RoleDeleting {
+			// Skip roles that are already being deleted
 			continue
 		}
 		scoreInfo := c.calculateRoleScore(ms, groupName, targetRole.Name, role.Name)
@@ -898,20 +900,30 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		nonProtectedScores = allScores
 	}
 
+	// Sort both lists by priority tuple: (priority, deletionCost, index)
+	// Lower priority value = higher deletion priority (delete first)
+	// Lower deletion cost = higher deletion priority
+	// Higher index = higher deletion priority (backward compatibility)
 	sortRoles := func(a, b RoleWithScore) int {
+		// Primary: Sort by priority (not-ready first)
 		if a.Priority != b.Priority {
-			return cmp.Compare(a.Priority, b.Priority)
+			return cmp.Compare(a.Priority, b.Priority) // Ascending: lower priority (not-ready) first
 		}
+
+		// Secondary: Among roles with same priority, lower deletion cost comes first
 		if a.DeletionCost != b.DeletionCost {
-			return cmp.Compare(a.DeletionCost, b.DeletionCost)
+			return cmp.Compare(a.DeletionCost, b.DeletionCost) // Ascending: lower cost first
 		}
-		return cmp.Compare(b.Index, a.Index)
+
+		// Tertiary: Higher index comes first (backward compatibility)
+		return cmp.Compare(b.Index, a.Index) // Descending: higher indices first
 	}
 
 	slices.SortFunc(nonProtectedScores, sortRoles)
 
 	totalToDelete := max(0, len(allScores)-expectedCount)
 
+	// Role needs to scale down, and the ServingGroup status needs to be set to Scaling
 	err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), groupName, datastore.ServingGroupScaling)
 	klog.V(4).Infof("Setting ServingGroup %s/%s status to Scaling for role %s scaling down", ms.Namespace+"/"+ms.Name, groupName, targetRole.Name)
 	if err != nil {
@@ -919,6 +931,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		return
 	}
 
+	// Delete non-protected roles first (replicas after the first partition replicas)
 	numNonProtectedToDelete := min(totalToDelete, len(nonProtectedScores))
 	for i := 0; i < numNonProtectedToDelete; i++ {
 		target := nonProtectedScores[i]
@@ -927,8 +940,10 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		c.DeleteRole(ctx, ms, groupName, targetRole.Name, target.Name)
 	}
 
+	// After all non-protected roles are deleted, proceed to delete protected roles if needed
 	remainingToDelete := totalToDelete - numNonProtectedToDelete
 	if remainingToDelete > 0 && partition > 0 {
+		// Sort protected scores only when we need to delete them
 		slices.SortFunc(protectedScores, sortRoles)
 		numProtectedToDelete := min(remainingToDelete, len(protectedScores))
 		for i := 0; i < numProtectedToDelete; i++ {
@@ -949,6 +964,9 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		klog.Errorf("scaleUpRoles: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
 	}
 
+	// Find the maximum ordinal in existing roles.
+	// Since roleList is already sorted in ascending order by ordinal,
+	// we can track maxOrdinal while building existingOrdinals.
 	maxOrdinal := -1
 	existingOrdinals := make(map[int]bool)
 	for _, role := range roleList {
@@ -970,13 +988,17 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		return
 	}
 
+	// Helper function to create a Role
 	createRole := func(ordinal int, revision string, roleToApply workloadv1alpha1.Role, roleTemplateHash string) error {
+		// Create pods for role
 		err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), ms, ordinal, servingGroupOrdinal, revision, roleTemplateHash)
 		if err != nil {
 			return fmt.Errorf("create role %s for ServingGroup %s failed: %v", utils.GenerateRoleID(targetRole.Name, ordinal), groupName, err)
 		}
+		// Insert new Role to global storage
 		roleID := utils.GenerateRoleID(targetRole.Name, ordinal)
 		c.store.AddRole(utils.GetNamespaceName(ms), groupName, targetRole.Name, roleID, revision, roleTemplateHash)
+		// Emit event for new role entering Creating state
 		message := fmt.Sprintf("Role %s/%s in ServingGroup %s is now Creating", targetRole.Name, roleID, groupName)
 		c.emitRoleStatusEvent(ms, corev1.EventTypeNormal, "RoleCreating", message)
 		return nil
@@ -985,6 +1007,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 	if partitionConfigured && partition > 0 {
 		klog.V(4).Infof("scaleUpRoles: partition=%d set, filling missing ordinals in [0, %d) for role %s in ServingGroup %s",
 			partition, partition, targetRole.Name, groupName)
+		// When partition is set, fill missing ordinals in [0, partition) using CurrentRevision
 		for ordinal := 0; ordinal < partition && ordinal < expectedCount; ordinal++ {
 			if existingOrdinals[ordinal] {
 				klog.V(4).Infof("scaleUpRoles: ordinal %d already exists, skipping", ordinal)
@@ -998,6 +1021,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 				klog.Errorf("%v", err)
 				continue
 			}
+			// Update existingOrdinals and maxOrdinal
 			existingOrdinals[ordinal] = true
 			if ordinal > maxOrdinal {
 				maxOrdinal = ordinal
@@ -1005,11 +1029,14 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 		}
 	}
 
+	// Create new Roles with increasing indices starting from the current max index + 1
+	// Calculate how many new Roles we need to create
 	toCreate := expectedCount - len(existingOrdinals)
 	klog.V(2).Infof("scaling up role %s in ServingGroup %s: creating %d new replicas", targetRole.Name, groupName, toCreate)
 	if toCreate > 0 {
 		startingIndex := maxOrdinal + 1
 		roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
+		// Create new Roles with increasing indices
 		for i := 0; i < toCreate; i++ {
 			newIndex := startingIndex + i
 			if err := createRole(newIndex, newRevision, targetRole, roleTemplateHash); err != nil {
@@ -2193,6 +2220,7 @@ func (c *ModelServingController) getPartition(config *workloadv1alpha1.RollingUp
 	if config == nil || config.Partition == nil {
 		return 0, false, nil
 	}
+	// Percentage partition requires replicas to compute the absolute value.
 	partition, err := intstr.GetScaledValueFromIntOrPercent(config.Partition, replicas, true)
 	if err != nil {
 		return 0, true, err
