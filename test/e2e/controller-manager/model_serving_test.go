@@ -1504,7 +1504,8 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 	require.NoError(t, err)
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 
-	// Verify: only protected ordinals 0-2 remain with old revision, no updated groups
+	// Verify: only protected ordinals 0-2 remain with old revision, no updated groups,
+	// and the ModelServing status has converged to reflect only the remaining groups.
 	require.Eventually(t, func() bool {
 		ordinalStates, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
 		if err != nil {
@@ -1516,18 +1517,33 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 			return false
 		}
 
+		// verify ModelServing status feilds have also converged
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("Failed to get ModelServing: %v", err)
+			return false
+		}
+		if ms.Status.Replicas != scaledReplicas {
+			t.Logf("Status.Replicas: %d (expecting %d)", ms.Status.Replicas, scaledReplicas)
+			return false
+		}
+		if ms.Status.UpdatedReplicas != 0 {
+			t.Logf("Status.UpdatedReplicas: %d (expecting 0)", ms.Status.UpdatedReplicas)
+			return false
+		}
+		if ms.Status.CurrentReplicas != scaledReplicas {
+			t.Logf("Status.CurrentReplicas: %d (expecting %d)", ms.Status.CurrentReplicas, scaledReplicas)
+			return false
+		}
+		if ms.Status.AvailableReplicas != scaledReplicas {
+			t.Logf("Status.AvailableReplicas: %d (expecting %d)", ms.Status.AvailableReplicas, scaledReplicas)
+			return false
+		}
+
 		// All remaining groups should be on the old (current) revision
 		protectedCorrect, updatedCorrect := verifyPartitionState(t, ordinalStates, partition, scaledReplicas, initialRevision, updateRevision)
 		return protectedCorrect == int(scaledReplicas) && updatedCorrect == 0
 	}, 3*time.Minute, 2*time.Second, "Scale down did not converge to only protected groups")
-
-	finalMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Equal(t, scaledReplicas, *finalMS.Spec.Replicas)
-	require.Equal(t, scaledReplicas, finalMS.Status.Replicas)
-	require.Equal(t, int32(0), finalMS.Status.UpdatedReplicas)
-	require.Equal(t, scaledReplicas, finalMS.Status.CurrentReplicas)
-	require.Equal(t, scaledReplicas, finalMS.Status.AvailableReplicas)
 
 	t.Log("ModelServing partition scale down test passed successfully")
 }
