@@ -56,17 +56,25 @@ spec:
                   periodSeconds: 10
               - name: engine
                 image: ${ENGINE_SERVER_IMAGE}
+                imagePullPolicy: IfNotPresent
                 command: ${ENGINE_SERVER_COMMAND}
                 env: ${ENGINE_ENV}
                 resources: ${ENGINE_SERVER_RESOURCES}
                 volumeMounts: ${VOLUME_MOUNTS}
+                startupProbe:
+                  failureThreshold: 30
+                  httpGet:
+                    path: /health
+                    port: 8000
+                    scheme: HTTP
+                  periodSeconds: 10
+                  timeoutSeconds: 1
                 readinessProbe:
                   failureThreshold: 3
                   httpGet:
                     path: /health
                     port: 8000
                     scheme: HTTP
-                  initialDelaySeconds: 180
                   periodSeconds: 5
                   successThreshold: 1
                   timeoutSeconds: 1

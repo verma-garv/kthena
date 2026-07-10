@@ -65,9 +65,12 @@ func TestModelCR(t *testing.T) {
 			t.Logf("Get model error: %v", err)
 			return false
 		}
+		for _, c := range m.Status.Conditions {
+			t.Logf("ModelBooster condition: type=%s status=%s reason=%s message=%s", c.Type, c.Status, c.Reason, c.Message)
+		}
 		return meta.IsStatusConditionPresentAndEqual(m.Status.Conditions,
 			string(workload.ModelStatusConditionTypeActive), metav1.ConditionTrue)
-	}, 10*time.Minute, 5*time.Second, "Model did not become Active")
+	}, 5*time.Minute, 5*time.Second, "Model did not become Active")
 
 	// Test chat via port-forward
 	messages := []utils.ChatMessage{
@@ -261,9 +264,12 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		if err != nil {
 			return false
 		}
+		for _, c := range m.Status.Conditions {
+			t.Logf("ModelBooster condition: type=%s status=%s reason=%s message=%s", c.Type, c.Status, c.Reason, c.Message)
+		}
 		return meta.IsStatusConditionPresentAndEqual(m.Status.Conditions,
 			string(workload.ModelStatusConditionTypeActive), metav1.ConditionTrue)
-	}, 10*time.Minute, 5*time.Second, "Model did not become Active")
+	}, 5*time.Minute, 5*time.Second, "Model did not become Active")
 
 	t.Log("Model is active. Testing self-healing of ModelServing...")
 

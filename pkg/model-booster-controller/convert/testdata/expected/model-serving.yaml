@@ -106,6 +106,7 @@ spec:
                     --tensor-parallel-size 2 --trust-remote-code --distributed_executor_backend ray
                   
                 image: vllm-server:latest
+                imagePullPolicy: IfNotPresent
                 lifecycle:
                   preStop:
                     exec:
@@ -163,13 +164,20 @@ spec:
                         key: REDIS_PASSWORD
                         name: redis-secret
                         optional: true
+                startupProbe:
+                  failureThreshold: 30
+                  httpGet:
+                    path: /health
+                    port: 8000
+                    scheme: HTTP
+                  periodSeconds: 10
+                  timeoutSeconds: 1
                 readinessProbe:
                   failureThreshold: 3
                   httpGet:
                     path: /health
                     port: 8000
                     scheme: HTTP
-                  initialDelaySeconds: 180
                   periodSeconds: 5
                   successThreshold: 1
                   timeoutSeconds: 1
