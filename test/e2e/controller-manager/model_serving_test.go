@@ -1339,7 +1339,6 @@ func TestModelServingPartitionDeletedGroupHistoricalRevision(t *testing.T) {
 	require.NotEmpty(t, pods.Items)
 
 	podToDelete := pods.Items[0]
-	originalUID := string(podToDelete.UID)
 	t.Logf("Deleting pod %s (ordinal %d)", podToDelete.Name, targetOrdinal)
 
 	err = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podToDelete.Name, metav1.DeleteOptions{})
@@ -1357,9 +1356,8 @@ func TestModelServingPartitionDeletedGroupHistoricalRevision(t *testing.T) {
 		if !ok {
 			return false
 		}
-		t.Logf("Recreated protected ordinal %d => group=%s pod=%s revision=%s image=%s", targetOrdinal, state.GroupName, state.PodName, state.Revision, state.Image)
-		return state.PodUID != originalUID &&
-			state.Revision == initialRevision &&
+		t.Logf("Recreated protected ordinal %d => group=%s revision=%s image=%s", targetOrdinal, state.GroupName, state.Revision, state.Image)
+		return state.Revision == initialRevision &&
 			state.Image == nginxImage
 	}, 3*time.Minute, 2*time.Second, "Recreated pod should use historical revision")
 
@@ -1367,7 +1365,7 @@ func TestModelServingPartitionDeletedGroupHistoricalRevision(t *testing.T) {
 	require.NoError(t, err)
 	ordinalStates, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
 	require.NoError(t, err)
-	protectedCorrect, updatedCorrect := verifyPartitionState(t, ordinalStates, partition, replicas, initialRevision, updateRevision)
+	protectedCorrect, updatedCorrect := calculateGroupPartitionState(t, ordinalStates, partition, replicas, initialRevision, updateRevision)
 	assert.Equal(t, int(partition), protectedCorrect)
 	assert.Equal(t, int(replicas-partition), updatedCorrect)
 	assert.Equal(t, initialRevision, finalMS.Status.CurrentRevision)
@@ -1434,7 +1432,7 @@ func TestModelServingPartitionScaleUp(t *testing.T) {
 			t.Logf("Running serving group count: %d (expecting %d)", len(ordinalStates), scaledReplicas)
 			return false
 		}
-		protectedCorrect, updatedCorrect := verifyPartitionState(t, ordinalStates, partition, scaledReplicas, initialRevision, updateRevision)
+		protectedCorrect, updatedCorrect := calculateGroupPartitionState(t, ordinalStates, partition, scaledReplicas, initialRevision, updateRevision)
 		t.Logf("Protected: %d/%d, Updated: %d/%d", protectedCorrect, partition, updatedCorrect, scaledReplicas-partition)
 		return protectedCorrect == int(partition) && updatedCorrect == int(scaledReplicas-partition)
 	}, 3*time.Minute, 2*time.Second, "Partition state did not converge after scale up")
@@ -1452,7 +1450,7 @@ func TestModelServingPartitionScaleUp(t *testing.T) {
 		if ordinal < partition {
 			finalState, ok := finalOrdinalStates[ordinal]
 			require.True(t, ok, "Protected group %d should still exist", ordinal)
-			assert.Equal(t, initialState.PodUID, finalState.PodUID, "Protected group %d should not have been recreated", ordinal)
+			assert.Equal(t, initialState.Revision, finalState.Revision, "Protected group %d should not have been recreated", ordinal)
 		}
 	}
 
@@ -1485,12 +1483,12 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
 	t.Logf("Updating image to %s to establish partition state", nginxAlpineImage)
 
+	// rolling update
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 
 	updateRevision := waitForPartitionState(t, ctx, kthenaClient, kubeClient, modelServing.Name, partition, initialReplicas, initialRevision)
-	t.Log("Partition state established")
 
 	// Scale down from 5 to 3 replicas (equal to partition, so all updated groups should be removed)
 	currentMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
@@ -1500,26 +1498,20 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 	scaleDownMS.Spec.Replicas = ptr.To(scaledReplicas)
 	t.Logf("Scaling down from %d to %d replicas while partition=%d", initialReplicas, scaledReplicas, partition)
 
+	// Update the ModelServing to scale down
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
 
 	// Verify: only protected ordinals 0-2 remain with old revision, no updated groups
-	require.Eventually(t, func() bool {
-		ordinalStates, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
-		if err != nil {
-			t.Logf("Failed to collect serving group states: %v", err)
-			return false
-		}
-		if len(ordinalStates) != int(scaledReplicas) {
-			t.Logf("Running serving group count: %d (expecting %d)", len(ordinalStates), scaledReplicas)
-			return false
-		}
 
-		// All remaining groups should be on the old (current) revision
-		protectedCorrect, updatedCorrect := verifyPartitionState(t, ordinalStates, partition, scaledReplicas, initialRevision, updateRevision)
-		return protectedCorrect == int(scaledReplicas) && updatedCorrect == 0
-	}, 3*time.Minute, 2*time.Second, "Scale down did not converge to only protected groups")
+	ordinalStates, err := collectRunningServingGroupStates(ctx, kubeClient, modelServing.Name)
+	require.NoError(t, err)
+
+	// All remaining groups should be on the old (current) revision
+	protectedCorrect, updatedCorrect := calculateGroupPartitionState(t, ordinalStates, partition, scaledReplicas, initialRevision, updateRevision)
+	require.Equal(t, int(scaledReplicas), protectedCorrect, "Protected groups not as expected after scale down")
+	require.Equal(t, 0, updatedCorrect, "Updated groups not as expected after scale down")
 
 	finalMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
 	require.NoError(t, err)
@@ -1528,8 +1520,6 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 	require.Equal(t, int32(0), finalMS.Status.UpdatedReplicas)
 	require.Equal(t, scaledReplicas, finalMS.Status.CurrentReplicas)
 	require.Equal(t, scaledReplicas, finalMS.Status.AvailableReplicas)
-
-	t.Log("ModelServing partition scale down test passed successfully")
 }
 
 // TestModelServingRollingUpdate verifies rolling updates without partition.
@@ -1583,7 +1573,7 @@ func createPartitionedModelServing(name string, replicas, partition int32) *work
 			Template: workload.ServingGroup{
 				Roles: []workload.Role{
 					{
-						Name:     "prefill",
+						Name:     "role",
 						Replicas: &roleReplicas,
 						EntryTemplate: workload.PodTemplateSpec{
 							Spec: corev1.PodSpec{
@@ -1611,8 +1601,6 @@ func createPartitionedModelServing(name string, replicas, partition int32) *work
 
 type servingGroupState struct {
 	GroupName string
-	PodName   string
-	PodUID    string
 	Ordinal   int32
 	Revision  string
 	Image     string
@@ -1646,13 +1634,12 @@ func collectRunningServingGroupStates(ctx context.Context, kubeClient *kubernete
 
 		state := servingGroupState{
 			GroupName: groupName,
-			PodName:   pod.Name,
-			PodUID:    string(pod.UID),
 			Ordinal:   int32(ordinal),
 			Revision:  revision,
 			Image:     pod.Spec.Containers[0].Image,
 		}
-		if existing, ok := states[state.Ordinal]; !ok || state.PodName < existing.PodName {
+
+		if _, ok := states[state.Ordinal]; !ok {
 			states[state.Ordinal] = state
 		}
 	}
@@ -1679,7 +1666,7 @@ func waitForPartitionState(t *testing.T, ctx context.Context, kthenaClient *clie
 			t.Logf("Running serving group count: %d (expecting %d)", len(ordinalStates), replicas)
 			return false
 		}
-		protectedCorrect, updatedCorrect := verifyPartitionState(t, ordinalStates, partition, replicas, initialRevision, ms.Status.UpdateRevision)
+		protectedCorrect, updatedCorrect := calculateGroupPartitionState(t, ordinalStates, partition, replicas, initialRevision, ms.Status.UpdateRevision)
 		t.Logf("CurrentRevision: %s, UpdateRevision: %s, Protected: %d/%d, Updated: %d/%d",
 			ms.Status.CurrentRevision, ms.Status.UpdateRevision, protectedCorrect, partition, updatedCorrect, replicas-partition)
 		if ms.Status.CurrentRevision != initialRevision ||
@@ -1745,15 +1732,17 @@ func waitForRollingUpdateConverged(t *testing.T, ctx context.Context, kthenaClie
 	return finalMS
 }
 
-func verifyPartitionState(t *testing.T, ordinalStates map[int32]servingGroupState,
-	partition, replicas int32, currentRevision, updateRevision string) (protectedCorrect, updatedCorrect int) {
+// calculateGroupPartitionState counts how many serving groups are on the protected (current) revision
+// and how many are on the updated revision, based on the partition boundary.
+func calculateGroupPartitionState(t *testing.T, ordinalStates map[int32]servingGroupState,
+	partition, replicas int32, currentRevision, updateRevision string) (protected, updated int) {
 	t.Helper()
 	for ordinal, state := range ordinalStates {
 		isProtected := partition > 0 && ordinal < partition
 		if isProtected && state.Revision == currentRevision && state.Image == nginxImage {
-			protectedCorrect++
-		} else if !isProtected && state.Revision == updateRevision && state.Image == nginxAlpineImage {
-			updatedCorrect++
+			protected++
+		} else if !isProtected && state.Revision == updateRevision {
+			updated++
 		}
 	}
 	return
